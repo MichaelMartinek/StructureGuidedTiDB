@@ -117,6 +117,9 @@ import (
 	hintSemiJoinRewrite       "SEMI_JOIN_REWRITE"
 	hintNoDecorrelate         "NO_DECORRELATE"
 
+	/* Yannakakis hint */
+	hintYanNormal             "YAN_NORMAL"
+
 	/* Other keywords */
 	hintOLAP            "OLAP"
 	hintOLTP            "OLTP"
@@ -257,6 +260,12 @@ TableOptimizerHintOpt:
 			HintName: model.NewCIStr($1),
 			QBName:   model.NewCIStr($3),
 			HintData: $4,
+		}
+	}
+|	"YAN_NORMAL" '('  ')'
+	{
+		$$ = &ast.TableOptimizerHint{
+			HintName: model.NewCIStr($1),
 		}
 	}
 |	"NTH_PLAN" '(' QueryBlockOpt hintIntLit ')'
@@ -682,6 +691,8 @@ Identifier:
 |	"SET_VAR"
 |	"RESOURCE_GROUP"
 |	"QB_NAME"
+/* Yannakakis hint */
+|   "YAN_NORMAL"
 /* TiDB hint names */
 |	"AGG_TO_COP"
 |	"LIMIT_TO_COP"

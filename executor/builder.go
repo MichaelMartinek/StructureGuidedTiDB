@@ -98,6 +98,10 @@ type executorBuilder struct {
 	// can return a correct value even if the session context has already been destroyed
 	forDataReaderBuilder bool
 	dataReaderTS         uint64
+
+	// precompiledExecutors precompiled executors for CTEs for Yannakakis algorithm evaluation
+	// it is used when a CTE occurrs multiple times with the same ID, such that it is only once compiled and reused
+	precompiledExecutors map[int]Executor
 }
 
 // CTEStorages stores resTbl and iterInTbl for CTEExec.
@@ -5197,6 +5201,11 @@ func (b *executorBuilder) buildTableSample(v *plannercore.PhysicalTableSample) *
 }
 
 func (b *executorBuilder) buildCTE(v *plannercore.PhysicalCTE) Executor {
+	// Check if there is a prebuilt executor, in this case return it
+	if len(b.precompiledExecutors) > 0 && b.precompiledExecutors[v.ID()] != nil {
+		return b.precompiledExecutors[v.ID()]
+	}
+
 	// 1. Build seedPlan.
 	if b.Ti != nil {
 		b.Ti.UseNonRecursive = true
@@ -5204,6 +5213,14 @@ func (b *executorBuilder) buildCTE(v *plannercore.PhysicalCTE) Executor {
 	seedExec := b.build(v.SeedPlan)
 	if b.err != nil {
 		return nil
+	}
+
+	// Check if a CTEMockExec should be used (for Yannakakis if there is no other consumer):
+	if b.ctx.GetSessionVars().StmtCtx.GetPrimaryCTEUsageCounter()[v.CTE.IDForStorage] == 1 {
+		return &CTEMockExec{
+			baseExecutor: newBaseExecutor(b.ctx, v.Schema(), v.ID()),
+			seedExec:     seedExec,
+		}
 	}
 
 	// 2. Build tables to store intermediate results.

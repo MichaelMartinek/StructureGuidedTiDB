@@ -937,6 +937,8 @@ var hintTokenMap = map[string]int{
 	"RESOURCE_GROUP":        hintResourceGroup,
 	"QB_NAME":               hintQBName,
 
+	"YAN_NORMAL": hintYanNormal,
+
 	// TiDB hint names
 	"AGG_TO_COP":              hintAggToCop,
 	"LIMIT_TO_COP":            hintLimitToCop,

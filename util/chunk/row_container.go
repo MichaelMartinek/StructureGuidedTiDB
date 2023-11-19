@@ -280,6 +280,9 @@ func (c *RowContainer) GetDiskTracker() *disk.Tracker {
 
 // Close close the RowContainer
 func (c *RowContainer) Close() (err error) {
+	if c == nil { // Change by MichaelMartinek to fix the explain analyze command
+		return
+	}
 	c.m.RLock()
 	defer c.m.RUnlock()
 	if c.actionSpill != nil {

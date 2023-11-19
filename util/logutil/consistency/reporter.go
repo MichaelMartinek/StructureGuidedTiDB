@@ -185,6 +185,9 @@ func decodeMvccRecordValue(bs []byte, colMap map[int64]*types.FieldType, tb *mod
 
 // ReportLookupInconsistent reports inconsistent when index rows is more than record rows.
 func (r *Reporter) ReportLookupInconsistent(ctx context.Context, idxCnt, tblCnt int, missHd, fullHd []kv.Handle, missRowIdx []RecordData) error {
+	if r.Sctx.GetSessionVars().StmtCtx.GetIsEmpty() {
+		return nil
+	}
 	if r.Sctx.GetSessionVars().EnableRedactLog {
 		logutil.Logger(ctx).Error("indexLookup found data inconsistency",
 			zap.String("table_name", r.Tbl.Name.O),

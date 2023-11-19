@@ -419,6 +419,8 @@ type IndexLookUpExecutor struct {
 	// If dummy flag is set, this is not a real IndexLookUpReader, it just provides the KV ranges for UnionScan.
 	// Used by the temporary table, cached table.
 	dummy bool
+
+	emptyResult bool // if the result of the underlying operator is empty, this is set to true; used internally by the operator
 }
 
 type getHandleType int8
@@ -513,6 +515,7 @@ func (e *IndexLookUpExecutor) open(ctx context.Context) error {
 	// instead of in function "Open", because this "IndexLookUpExecutor" may be
 	// constructed by a "IndexLookUpJoin" and "Open" will not be called in that
 	// situation.
+	e.emptyResult = true
 	e.initRuntimeStats()
 	e.memTracker = memory.NewTracker(e.id, -1)
 	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
@@ -782,6 +785,18 @@ func (e *IndexLookUpExecutor) Next(ctx context.Context, req *chunk.Chunk) error 
 		if resultTask == nil {
 			return nil
 		}
+		// YAN early stop: check if there are rows in the result, if not, then do a early stop
+		if e.emptyResult {
+			if len(resultTask.rows) == 0 {
+				if e.ctx.GetSessionVars().StmtCtx.GetIsYannakakis() {
+					e.ctx.GetSessionVars().StmtCtx.SetIsEmpty()
+					logutil.BgLogger().Info("YAN early stop IndexLookupExec")
+				}
+			} else {
+				e.emptyResult = false
+			}
+		}
+		// YAN early stop end
 		if resultTask.cursor < len(resultTask.rows) {
 			numToAppend := mathutil.Min(len(resultTask.rows)-resultTask.cursor, req.RequiredRows()-req.NumRows())
 			req.AppendRows(resultTask.rows[resultTask.cursor : resultTask.cursor+numToAppend])

@@ -304,6 +304,7 @@ func DoOptimize(ctx context.Context, sctx sessionctx.Context, flag uint64, logic
 	if err != nil {
 		return nil, 0, err
 	}
+
 	finalPlan, err := postOptimize(ctx, sctx, physical)
 	if err != nil {
 		return nil, 0, err

@@ -52,6 +52,7 @@ import (
 	"github.com/pingcap/tidb/sessiontxn"
 	"github.com/pingcap/tidb/sessiontxn/staleread"
 	"github.com/pingcap/tidb/types"
+	util2 "github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/breakpoint"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/execdetails"
@@ -177,7 +178,19 @@ func (a *recordSet) NewChunk(alloc chunk.Allocator) *chunk.Chunk {
 func (a *recordSet) Close() error {
 	err := a.executor.Close()
 	a.stmt.CloseRecordSet(a.txnStartTS, a.lastErr)
+	if a.executor.base().ctx.GetSessionVars().StmtCtx.GetIsYannakakis() || a.executor.base().ctx.GetSessionVars().StmtCtx.GetIsYanNormal() {
+		logQuery(a.executor.base().ctx.ShowProcess(), "Query Info")
+	}
 	return err
+}
+
+// logQuery logs the queries important data
+func logQuery(info *util2.ProcessInfo, msg string) {
+	fields := util2.GenLogFields2(info, true)
+	if fields == nil {
+		return
+	}
+	logutil.BgLogger().Info(msg, fields...)
 }
 
 // OnFetchReturned implements commandLifeCycle#OnFetchReturned
@@ -1168,6 +1181,9 @@ func (a *ExecStmt) buildExecutor() (Executor, error) {
 	if b.err != nil {
 		return nil, errors.Trace(b.err)
 	}
+
+	// reset cteCount in case it was set
+	ctx.GetSessionVars().StmtCtx.SetPrimaryCTEUsageCounter(make(map[int]int))
 
 	failpoint.Inject("assertTxnManagerAfterBuildExecutor", func() {
 		sessiontxn.RecordAssert(a.Ctx, "assertTxnManagerAfterBuildExecutor", true)

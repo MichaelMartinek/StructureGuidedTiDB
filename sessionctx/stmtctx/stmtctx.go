@@ -390,6 +390,25 @@ type StatementContext struct {
 	TableStats map[int64]interface{}
 	// useChunkAlloc indicates whether statement use chunk alloc
 	useChunkAlloc bool
+
+	// cteUsageCounters record the number of cte usages
+	cteUsageCounters map[int]map[int]int
+
+	// secondaryPlans LogicalPlans used as secondary in yannakakis query processing
+	// Using interface here due to an otherwise occurring import cycle
+	secondaryPlans map[int]interface{}
+
+	// is Yannakakis statement: this statement is executed with Yannakakis; has implications on executor optimizaiton
+	isYannakakis bool
+
+	// record that the result of the current statement is empty
+	isEmpty bool
+
+	// isYanNormal states if the YAN_NORMAL optimizer hint is used in this statement
+	isYanNormal bool
+
+	// CTEUsageCounter: a counter which contains the number of occurrences of each CTE (indexed with the IDForStorage) in the Plan
+	CTEUsageCounter map[int]int
 }
 
 // StmtHints are SessionVars related sql hints.
@@ -568,6 +587,99 @@ func (sc *StatementContext) ClearUseChunkAlloc() {
 // GetUseChunkAllocStatus returns useChunkAlloc status
 func (sc *StatementContext) GetUseChunkAllocStatus() bool {
 	return sc.useChunkAlloc
+}
+
+// SetIsYannakakis set the state of this statement to be executed with Yannakakis algorithm, has implications on execution optimizations
+func (sc *StatementContext) SetIsYannakakis() {
+	sc.isYannakakis = true
+}
+
+// ClearIsYannakakis clear the state of this statement to be executed with Yannakakis algorithm (set to false), has implications on execution optimizations
+func (sc *StatementContext) ClearIsYannakakis() {
+	sc.isYannakakis = false
+}
+
+// GetIsYannakakis get the state wether this statement is executed with Yannakakis algorithm
+func (sc *StatementContext) GetIsYannakakis() bool {
+	return sc.isYannakakis
+}
+
+// SetIsEmpty record that the result is empty
+func (sc *StatementContext) SetIsEmpty() {
+	sc.isEmpty = true
+}
+
+// ClearIsEmpty clear empty state
+func (sc *StatementContext) ClearIsEmpty() {
+	sc.isEmpty = false
+}
+
+// GetIsEmpty get empty state
+func (sc *StatementContext) GetIsEmpty() bool {
+	return sc.isEmpty
+}
+
+// SetIsYanNormal set the state of this statement if the YAN_NORMAL hint is set
+func (sc *StatementContext) SetIsYanNormal() {
+	sc.isYanNormal = true
+}
+
+// ClearIsYanNormal clear the state of this statement if the YAN_NORMAL hint is set
+func (sc *StatementContext) ClearIsYanNormal() {
+	sc.isYanNormal = false
+}
+
+// GetIsYanNormal get the state if the YAN_NORMAL hint is set
+func (sc *StatementContext) GetIsYanNormal() bool {
+	return sc.isYanNormal
+}
+
+// SetCTEUsageCounter set the ith cte usage counter
+func (sc *StatementContext) SetCTEUsageCounter(i int, cteCount map[int]int) {
+	if sc.cteUsageCounters == nil {
+		sc.cteUsageCounters = make(map[int]map[int]int)
+	}
+	sc.cteUsageCounters[i] = cteCount
+}
+
+// ClearCTEUsageCounter clear the state of the cte usage counter
+func (sc *StatementContext) ClearCTEUsageCounter() {
+	sc.cteUsageCounters = make(map[int]map[int]int)
+}
+
+// GetCTEUsageCounter get the ith cte usage counter
+func (sc *StatementContext) GetCTEUsageCounter(i int) map[int]int {
+	return sc.cteUsageCounters[i]
+}
+
+// SetSecondaryPlan set the ith secondaryPlan
+func (sc *StatementContext) SetSecondaryPlan(i int, plan interface{}) {
+	if sc.secondaryPlans == nil {
+		sc.secondaryPlans = make(map[int]interface{})
+	}
+	sc.secondaryPlans[i] = plan
+}
+
+// ClearSecondaryPlans clear the secondary plans
+func (sc *StatementContext) ClearSecondaryPlans() {
+	sc.secondaryPlans = make(map[int]interface{})
+}
+
+// GetSecondaryPlan get the ith secondary plan
+func (sc *StatementContext) GetSecondaryPlan(i int) interface{} {
+	return sc.secondaryPlans[i]
+}
+
+// GetPrimaryCTEUsageCounter a counter which contains the number of occurrences of each CTE (indexed with the IDForStorage) in the Plan
+// Is only present if set before
+func (sc *StatementContext) GetPrimaryCTEUsageCounter() map[int]int {
+	return sc.CTEUsageCounter
+}
+
+// SetPrimaryCTEUsageCounter  Set a counter which contains the number of occurrences of each CTE (indexed with the IDForStorage) in the Plan
+// Set operation neccesary for getting it later on
+func (sc *StatementContext) SetPrimaryCTEUsageCounter(newCTEUsageCounter map[int]int) {
+	sc.CTEUsageCounter = newCTEUsageCounter
 }
 
 // SetPlanDigest sets the normalized plan and plan digest.

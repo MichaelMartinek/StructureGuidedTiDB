@@ -580,6 +580,15 @@ type PlanBuilder struct {
 
 	// allowBuildCastArray indicates whether allow cast(... as ... array).
 	allowBuildCastArray bool
+
+	// subplans Temporarily stores subplans for yannakakis Logical Plan building, these plans are used later on during the creation of the Logical Plan, stored in the second phase (top down)
+	subplans map[string]LogicalPlan
+
+	// cteSubplans Temporarily store cteSubplans for yannakakis Logical Plan building, stores plans for a certain level (0: build base data, 1: bottom up SJ, 2: top down SJ)
+	cteSubplans map[int]map[string]LogicalPlan
+
+	// templateEQExpression This expression is used as template during yannakakis plan building
+	templateEQExpression ast.ExprNode
 }
 
 type handleColHelper struct {

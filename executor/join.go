@@ -123,6 +123,8 @@ type HashJoinExec struct {
 	workerWg util.WaitGroupWrapper
 	waiterWg util.WaitGroupWrapper
 
+	emptyResult bool // if the result of the underlying operator is empty, this is set to true; used internally by the operator
+
 	prepared bool
 }
 
@@ -146,7 +148,7 @@ type hashjoinWorkerResult struct {
 
 // Close implements the Executor Close interface.
 func (e *HashJoinExec) Close() error {
-	if e.closeCh != nil {
+	if e.closeCh != nil && !e.finished.Load() {
 		close(e.closeCh)
 	}
 	e.finished.Store(true)
@@ -165,8 +167,10 @@ func (e *HashJoinExec) Close() error {
 			channel.Clear(e.probeSideTupleFetcher.probeResultChs[i])
 		}
 		for i := range e.probeWorkers {
-			close(e.probeWorkers[i].joinChkResourceCh)
-			channel.Clear(e.probeWorkers[i].joinChkResourceCh)
+			if e.probeWorkers[i].joinChkResourceCh != nil {
+				close(e.probeWorkers[i].joinChkResourceCh)
+				channel.Clear(e.probeWorkers[i].joinChkResourceCh)
+			}
 		}
 		e.probeSideTupleFetcher.probeChkResourceCh = nil
 		terror.Call(e.rowContainer.Close)
@@ -1136,6 +1140,7 @@ func (e *HashJoinExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 		e.finished.Store(true)
 		return result.err
 	}
+
 	req.SwapColumns(result.chk)
 	result.src <- result.chk
 	return nil

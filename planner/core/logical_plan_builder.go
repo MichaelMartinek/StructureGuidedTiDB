@@ -17,8 +17,16 @@ package core
 import (
 	"context"
 	"fmt"
+	balancedGoAlgo "github.com/cem-okulmus/BalancedGo/algorithms"
+	balancedGo "github.com/cem-okulmus/BalancedGo/lib"
+	clone "github.com/huandu/go-clone/generic"
+	"github.com/pingcap/tidb/sessiontxn"
+	"github.com/pingcap/tidb/util/hypergraphBuilder"
+	"github.com/pingcap/tidb/util/slice"
+	"golang.org/x/exp/slices"
 	"math"
 	"math/bits"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -84,6 +92,9 @@ const (
 	HintStraightJoin = "straight_join"
 	// HintLeading specifies the set of tables to be used as the prefix in the execution plan.
 	HintLeading = "leading"
+
+	// Yannakakis hint --> Do not use Yannakakis
+	HintYannakakisNormal = "yan_normal"
 
 	// TiDBIndexNestedLoopJoin is hint enforce index nested loop join.
 	TiDBIndexNestedLoopJoin = "tidb_inlj"
@@ -3945,7 +3956,28 @@ func (b *PlanBuilder) TableHints() *tableHintInfo {
 	return &(b.tableHintInfo[len(b.tableHintInfo)-1])
 }
 
+// containsDuplicateNodeNamesOrEmptyBagCover: check if the given HyperTree contains duplicate node names or emty bags or covers, seen map has to be an empty map on the initial call
+func containsDuplicateNodeNamesOrEmptyBagCover(root balancedGo.NodeJson, seen map[string]bool) bool {
+	name := getDecompTreeNodeName(root)
+	if name == "" || slices.Contains(root.Bag, "") { // contains empty name (= cover), or bag --> do not accept
+		return true
+	}
+	if seen[name] {
+		return true
+	}
+	seen[name] = true
+	for _, child := range root.Children {
+		if containsDuplicateNodeNamesOrEmptyBagCover(child, seen) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p LogicalPlan, err error) {
+
+	// Moved from below to here
 	b.pushSelectOffset(sel.QueryBlockOffset)
 	b.pushTableHints(sel.TableHints, sel.QueryBlockOffset)
 	defer func() {
@@ -3953,6 +3985,157 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 		// table hints are only visible in the current SELECT statement.
 		b.popTableHints()
 	}()
+	/// Moved end
+
+	if sel.From != nil { // Allow things like select 1; or select 1 from dual; to work
+
+		start := time.Now()
+		isCaseForYannakakis, isSCAQuery, coveringRelation := isCaseForYannakakis(sel)
+		if sel.TableHints != nil && len(sel.TableHints) > 0 && sel.TableHints[0].HintName.L == HintYannakakisNormal {
+			b.ctx.GetSessionVars().StmtCtx.SetIsYanNormal() // Set this to enable logging of the Query Info
+		}
+		if isCaseForYannakakis {
+
+			// Build Hypergraph
+			hgs, hgmMap, tableSlice := buildHypergraphForSelect(sel)
+
+			// Detect and remove relations for cross product/cartesian product from hypergrah
+			tablesContainedAsCrossproducts, hgs := detectAndRemoveCartesianProductRelationsFromHG(hgs)
+
+			// Decompose with balancedGo
+			var decomp balancedGo.DecompJson
+			var decompOk = false
+			var secondaryDecompWg *util2.WaitGroupWrapper
+			var decompChans []chan balancedGo.DecompJson
+			var correctChans []chan bool
+			rowCounts := b.getRowCountsForTables(b.ctx.GetSessionVars().CurrentDB, tableSlice)
+			width := 1
+			hgString := strings.Join(hgs, "\n")
+			decomp, decompOk = decomposeWithBalancedGoAndJoinCosts(hgString, 1, rowCounts) // try with width 1
+			i := 0
+			for decompOk && containsDuplicateNodeNamesOrEmptyBagCover(decomp.Root, make(map[string]bool)) && i < 10 { // if there are duplicate NodeNames or empty bags or covers, redecompose
+				decomp, decompOk = decomposeWithBalancedGoAndJoinCosts(hgString, 1, rowCounts)
+				i++
+			}
+
+			if !decompOk { // width 1 did not yield a valid decomposition
+				i := 0
+				width = 2
+				decomp, decompOk = decomposeWithBalancedGoAndJoinCosts(hgString, 2, rowCounts) // try with width 2
+
+				for decompOk && containsDuplicateNodeNamesOrEmptyBagCover(decomp.Root, make(map[string]bool)) && i < 10 { // if there are duplicate NodeNames or empty bags or covers, redecompose
+					decomp, decompOk = decomposeWithBalancedGoAndJoinCosts(hgString, 2, rowCounts)
+					i++
+				}
+				if !decompOk || i >= 10 {
+					// this is not going to be done with yannakakis! Jump to normal planning
+					goto NORMAL
+				}
+			}
+
+			// Print HGM Map
+			/*for k, v := range hgmMap {
+				fmt.Print(k, " : ")
+				for _, e := range v {
+					fmt.Print("	", e)
+				}
+				fmt.Println("")
+			}*/
+			// Print HGM Map END
+
+			// Decompose with balancedGo END
+
+			timeNeededForDecomposition := time.Now().Sub(start)
+			logutil.BgLogger().Info(fmt.Sprintf("%s %s", "Time for decomposition: ", timeNeededForDecomposition))
+
+			// Start secondary decomposition
+			secondaryDecompWg, decompChans, correctChans = decomposeSecondariesWithBalancedGo(hgString, width, 2, rowCounts, isSCAQuery, coveringRelation)
+
+			// set isYan in stmtctx
+			b.ctx.GetSessionVars().StmtCtx.SetIsYannakakis()
+
+			// In case of sca, reroot decomp
+			if isSCAQuery {
+				startReroot := time.Now()
+
+				decomp = rerootDecomp(decomp, coveringRelation)
+
+				// special case for SCA and root cover len > 1 --> reorder such that the covering relation is at the last position
+				if len(decomp.Root.Cover) > 1 {
+					decomp.Root.Cover = reorderRootCover(decomp, coveringRelation)
+				}
+
+				timeNeededReroot := time.Now().Sub(startReroot)
+				logutil.BgLogger().Info(fmt.Sprintf("%s %s", "Time for rerooting the decomposition: ", timeNeededReroot))
+			}
+			// In case of sca, reroot decomp end
+
+			// Get a map of tablename --> TableSource of all the tables in the From
+			tableSources := make(map[string]*ast.TableSource)
+			getMapOfTableSources(sel.From.TableRefs, tableSources)
+
+			// Prepare various expressions needed for building the plan --> all where expressions, expressions comparing columns with values, and a template expression
+			whereExpressionNodes := splitWhere(sel.Where)
+			selectionExpressions := getSelectionExpressions(whereExpressionNodes)
+			b.templateEQExpression = getOneEQExpression(whereExpressionNodes)
+
+			// build logical plan for yannakakis
+			plan, err := b.buildLogicalPlanFromDecomposition(ctx, decomp, hgmMap, tableSources, whereExpressionNodes, sel.Fields.Fields[0].Text() == "1", isSCAQuery, sel, selectionExpressions, tablesContainedAsCrossproducts, width)
+			if err != nil {
+				return nil, err
+			}
+
+			timeNeededInitialPlan := time.Now().Sub(start)
+			logutil.BgLogger().Info(fmt.Sprintf("%s %s", "Time for building the initial plan: ", timeNeededInitialPlan))
+
+			// record the number of CTE usages to replace them with mocks (operators just forwarding chunks to the next operator), to avoid unneccesary memory occupation
+			cteFixTime := time.Now()
+			cteCount := make(map[int]int) // key: CTENumber, value: count
+			getCTECount(&plan, cteCount)
+			b.ctx.GetSessionVars().StmtCtx.SetPrimaryCTEUsageCounter(cteCount)
+
+			// fix isOutermostCTE
+			fixIsOuterMostCTE(&plan, false)
+
+			cteFixTime2 := time.Now().Sub(cteFixTime)
+			logutil.BgLogger().Info(fmt.Sprintf("%s %s", "Time for CTE fixes: ", cteFixTime2))
+			logutil.BgLogger().Info(fmt.Sprintf("%s %s", "Time since start excluding secondaries: ", time.Since(start)))
+
+			// compute secondaries:
+			(*secondaryDecompWg).Wait() // wait for decompositions to finish
+			for i := 0; i < 2; i++ {
+				corr := <-correctChans[i]
+				dec := <-decompChans[i]
+				if corr {
+					b.resetYanData()
+					// build logical plan for yannakakis
+					secPlan, err := b.buildLogicalPlanFromDecomposition(ctx, dec, hgmMap, tableSources, whereExpressionNodes, sel.Fields.Fields[0].Text() == "1", isSCAQuery, sel, selectionExpressions, tablesContainedAsCrossproducts, width)
+					if err != nil {
+						return nil, err
+					}
+
+					secCteCount := make(map[int]int) // key: CTENumber, value: count
+					getCTECount(&secPlan, secCteCount)
+					b.ctx.GetSessionVars().StmtCtx.SetCTEUsageCounter(i+1, secCteCount)
+
+					// fix isOutermostCTE
+					fixIsOuterMostCTE(&secPlan, false)
+
+					// store secondary plan
+					b.ctx.GetSessionVars().StmtCtx.SetSecondaryPlan(i, secPlan)
+
+				}
+				close(correctChans[i])
+				close(decompChans[i])
+			}
+
+			logutil.BgLogger().Info(fmt.Sprintf("%s %s", "Time since start including secondaries: ", time.Since(start)))
+
+			return plan, nil
+		}
+	}
+
+NORMAL:
 	if b.buildingRecursivePartForCTE {
 		if sel.Distinct || sel.OrderBy != nil || sel.Limit != nil {
 			return nil, ErrNotSupportedYet.GenWithStackByArgs("ORDER BY / LIMIT / SELECT DISTINCT in recursive query block of Common Table Expression")
@@ -4246,6 +4429,2143 @@ func (b *PlanBuilder) buildSelect(ctx context.Context, sel *ast.SelectStmt) (p L
 	}
 
 	return p, nil
+}
+
+// reorderRootCover: take the coveringRelation to the last position of the cover
+func reorderRootCover(decomp balancedGo.DecompJson, coveringRelation string) []string {
+	foundInd := -1
+	for ind, cov := range decomp.Root.Cover {
+		if cov == coveringRelation {
+			foundInd = ind
+			break
+		}
+	}
+	if foundInd == len(decomp.Root.Cover)-1 {
+		return decomp.Root.Cover
+	}
+	swp := decomp.Root.Cover
+	decomp.Root.Cover = append(make([]string, 0), swp[0:foundInd]...)
+	if foundInd+1 < len(swp) {
+		decomp.Root.Cover = append(decomp.Root.Cover, swp[foundInd+1:]...)
+	}
+	decomp.Root.Cover = append(decomp.Root.Cover, swp[foundInd])
+	return decomp.Root.Cover
+}
+
+// detectAndRemoveCartesianProductRelationsFromHG detect all relations included as cartesian product / cross product in the hypergraph, and return a list of them, as well as the new redacted hypergraph
+func detectAndRemoveCartesianProductRelationsFromHG(hgs []string) ([]string, []string) {
+	tablesContainedAsCrossproducts := make([]string, len(hgs), len(hgs))
+	crossProdCount := 0
+	toRemove := make([]bool, len(hgs), len(hgs))
+
+	for i, e := range hgs { // e is of the form tableName(vX,...)
+		if strings.HasSuffix(e, "()") { // no vertices (vX) --> Contained as cross product in the endresult
+			tablesContainedAsCrossproducts[crossProdCount] = strings.SplitN(e, "(", 2)[0]
+			crossProdCount++
+			toRemove[i] = true
+		}
+	}
+	tablesContainedAsCrossproducts = tablesContainedAsCrossproducts[:crossProdCount]
+
+	// remove cross product relations from hgs
+	if crossProdCount > 0 {
+		newHgs := make([]string, len(hgs), len(hgs))
+		newHgsCount := 0
+		for i := 0; i < len(hgs); i++ {
+			if !toRemove[i] {
+				newHgs[newHgsCount] = hgs[i]
+				newHgsCount++
+			}
+		}
+		hgs = newHgs[:newHgsCount]
+	}
+	return tablesContainedAsCrossproducts, hgs
+}
+
+// buildHypergraphForSelect: build a hypergraph for the given *ast.SelectStmt, returns the lines of the hypergraph as string[], and the respective mapping variable to columns
+func buildHypergraphForSelect(sel *ast.SelectStmt) ([]string, map[int][]string, []string) {
+	tableSlice := getListOfTables(sel.From.TableRefs)
+	eq := getEQConditionsList(sel.Where.(*ast.BinaryOperationExpr))
+	hgb := hypergraphBuilder.NewHypergraphBuilder(numberOfUniqueConditionSides(eq))
+
+	for _, t := range tableSlice {
+		hgb.BuildEdgeInit(t)
+	}
+
+	for _, jeq := range eq {
+		leftColumnNameExpresssion := jeq.L.(*ast.ColumnNameExpr)
+		hgb.BuildEdge(leftColumnNameExpresssion.Name.Table.L, leftColumnNameExpresssion.Name.Name.L)
+
+		rightColumnNameExpresssion := jeq.R.(*ast.ColumnNameExpr)
+		hgb.BuildEdge(rightColumnNameExpresssion.Name.Table.L, rightColumnNameExpresssion.Name.Name.L)
+
+		hgb.BuildJoin(jeq)
+	}
+
+	hgs := hgb.MakeHypergraph()
+	//hgm := hgb.GetMapping()
+	hgmMap := hgb.GetMappingAsMap()
+	return hgs, hgmMap, tableSlice
+}
+
+// getRowCountsForTables gets a map of tableName --> rowCount for the tables given and the respective database
+func (b *PlanBuilder) getRowCountsForTables(dbname string, tableNames []string) map[string]float64 {
+	is, _ := sessiontxn.GetTxnManager(b.ctx).GetTxnInfoSchema().(infoschema.InfoSchema)
+	dbn := model.NewCIStr(dbname)
+	rowCounts := make(map[string]float64)
+
+	for _, name := range tableNames {
+		tab, err := is.TableByName(dbn, model.NewCIStr(name))
+		if err != nil {
+			rowCounts[name] = 10000 // some default value
+		}
+		rc := getStatsTable(b.ctx, tab.Meta(), tab.Meta().ID).GetColRowCount()
+		if rc < 0 {
+			rc = 100 // some other default value for tables without row count / statistics, lower than the other one, since this could happen when there is not enough data in the table
+		}
+		rowCounts[name] = rc
+	}
+	return rowCounts
+}
+
+// nodeJSONToID Compute an id for a nodeJSON node
+// could be a future problem, due to only considering cover and bag, and these could reside multiple times in a hypertree decomposition
+func nodeJSONToID(node balancedGo.NodeJson) string {
+	s := ""
+	if node.Cover != nil {
+		if len(node.Cover) == 1 && strings.Compare(node.Cover[0], "NODATA_EMPTY") == 0 {
+			return ""
+		}
+		s = s + strings.Join(node.Cover, ",")
+	}
+	s = s + " | "
+	if node.Bag != nil {
+		s = s + strings.Join(node.Bag, ",")
+	}
+	return s
+}
+
+// rerootDecomp reroot the decomposition such that the node with the given relation is contained in the roots edge cover
+func rerootDecomp(decomp balancedGo.DecompJson, relation string) balancedGo.DecompJson {
+	// 1. Find node with bfs search + 2. Build parents map --> do in one traversal
+	queue := []balancedGo.NodeJson{}
+	queue = append(queue, decomp.Root)
+	var node balancedGo.NodeJson = balancedGo.NodeJson{Cover: []string{"NODATA_EMPTY"}}
+	parent := make(map[string]balancedGo.NodeJson)
+
+	for len(queue) > 0 {
+		if strings.Compare(nodeJSONToID(node), "") == 0 && slice.AnyOf(queue[0].Cover, func(i int) bool {
+			return strings.Compare(strings.ToLower(queue[0].Cover[i]), strings.ToLower(relation)) == 0
+		}) {
+			node = queue[0]
+		}
+
+		for i, _ := range queue[0].Children {
+			parent[nodeJSONToID(queue[0].Children[i])] = queue[0]
+			queue = append(queue, queue[0].Children[i])
+		}
+
+		queue = queue[1:]
+	}
+
+	// 3. Reroot
+	rerootedNode := doRerootDecomp(node, parent)
+
+	decomp.Root = rerootedNode
+	return decomp
+
+}
+
+// doRerootDecomp Do the rerooting itself, returns the rerooted balancedGo.NodeJson decomposition
+func doRerootDecomp(node balancedGo.NodeJson, parent map[string]balancedGo.NodeJson) balancedGo.NodeJson {
+	if nodeJSONToID(parent[nodeJSONToID(node)]) != nodeJSONToID(balancedGo.NodeJson{}) { // if this is not the (old) root
+		p := parent[nodeJSONToID(node)]
+
+		// get index of node in parent.children
+		ind := -1
+		for i, _ := range p.Children {
+			if nodeJSONToID(p.Children[i]) == nodeJSONToID(node) {
+				ind = i
+				break
+			}
+
+		}
+
+		// remove node as child of parent
+		oldChildren := p.Children
+		p.Children = nil
+		p.Children = append(oldChildren[:ind], oldChildren[ind+1:]...)
+
+		// call for parent
+		p = doRerootDecomp(p, parent)
+
+		// set parent as child of node
+		node.Children = append(node.Children, p)
+	}
+	return node
+}
+
+// getCTECount: Get the number of occurrences of each CTE in the plan; initially, cteCount should be an empty map and will be filled by this function
+func getCTECount(plan *LogicalPlan, cteCount map[int]int) {
+	p, isLogicalCTE := (*plan).(*LogicalCTE)
+	if isLogicalCTE { // Future inprovement: also count LogicalCTETables (which are not present in this plan anyways)
+		cteCount[p.cte.IDForStorage] = cteCount[p.cte.IDForStorage] + 1
+		getCTECount(&(p.cte.seedPartLogicalPlan), cteCount)
+	} else {
+		for _, childPlan := range (*plan).Children() {
+			getCTECount(&childPlan, cteCount)
+		}
+
+	}
+}
+
+// fixIsOuterMostCTE: set the isOuterMostCTE bool value of a LogicalCTE to true for the first cte in the query tree, otherwise set to false. cteSeen should be false on the initial call
+func fixIsOuterMostCTE(plan *LogicalPlan, cteSeen bool) {
+	p, ok := (*plan).(*LogicalCTE)
+	if ok {
+		if !cteSeen {
+			p.isOuterMostCTE = true
+			cteSeen = true
+		} else {
+			p.isOuterMostCTE = false
+		}
+	}
+
+	for _, c := range getChildren(*plan) {
+		fixIsOuterMostCTE(&c, cteSeen)
+
+	}
+
+}
+
+// getChildren Get the children of a LogicalPlan node
+func getChildren(plan LogicalPlan) []LogicalPlan {
+	childs := make([]LogicalPlan, 0, 0)
+
+	switch v := plan.(type) {
+	case nil:
+		return nil
+	case *DataSource:
+		// no child
+	case *LogicalAggregation:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalApply:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalCTE:
+		childs = append(childs, v.cte.seedPartLogicalPlan, v.cte.recursivePartLogicalPlan)
+	case *LogicalIndexScan:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalCTETable:
+		// no child
+	case *LogicalJoin:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalLimit:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalLock:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalMaxOneRow:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalMemTable:
+		// no child
+	case *LogicalPartitionUnionAll:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalProjection:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalSelection:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalShow:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalShowDDLJobs:
+		// no child
+	case *LogicalSort:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalTableDual:
+		// no children
+	case *LogicalTableScan:
+		// no child
+	case *LogicalTopN:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalUnionAll:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalUnionScan:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+	case *LogicalWindow:
+		for _, plan := range v.Children() {
+			childs = append(childs, plan)
+		}
+
+	default:
+		// nothing to do
+	}
+	return childs
+
+}
+
+// getSelectionExpressions Get all the ExpressionNodes which are present for comparing with values, e.g. t1.i = 5; ColumnExpr Operator ValueExpr as BinaryOperationExpression
+func getSelectionExpressions(nodes []ast.ExprNode) []ast.ExprNode {
+	exprNodes := make([]ast.ExprNode, len(nodes), len(nodes))
+	count := 0
+	for _, node := range nodes {
+		ex, _ := node.(*ast.BinaryOperationExpr)
+		_, leftCast := ex.L.(*ast.ColumnNameExpr)
+		_, rightCast := ex.R.(*driver.ValueExpr)
+		if leftCast && rightCast {
+			exprNodes[count] = node
+			count++
+		}
+	}
+	return exprNodes[:count]
+}
+
+// getOneEQExpression: Get one Expression of opration opcode.EQ, with left and right being ast.ColumnNameExpr, out of the given slice of ast.ExprNode
+func getOneEQExpression(nodes []ast.ExprNode) ast.ExprNode {
+	for _, node := range nodes {
+		ex, _ := node.(*ast.BinaryOperationExpr)
+		_, leftCast := ex.L.(*ast.ColumnNameExpr)
+		_, rightCast := ex.R.(*ast.ColumnNameExpr)
+		if ex.Op == opcode.EQ && leftCast && rightCast {
+			return node
+		}
+	}
+	return nil
+}
+
+// decomposeSecondariesWithBalancedGo : decomposes a hypergraph of a query, secondary decomposition for count instances;
+// asyncronous tasks run in returned WaitGroupWrapper, decompositions and correctness are put to the channels
+func decomposeSecondariesWithBalancedGo(hypergraph string, width int, count int, tableRowCount map[string]float64, isSCAQuery bool, coveringRelation string) (*util2.WaitGroupWrapper, []chan balancedGo.DecompJson, []chan bool) {
+	// init infrastructure for goroutines
+	wg := util2.WaitGroupWrapper{}
+	decompChans := make([]chan balancedGo.DecompJson, count)
+	correctChans := make([]chan bool, count)
+
+	// init values for decomposition
+	var parsedGraph balancedGo.Graph
+	var parseGraph balancedGo.ParseGraph
+	parsedGraph, parseGraph = balancedGo.GetGraph(hypergraph) // parse input Graph
+	originalGraph := parsedGraph
+	var addedVertices []int
+	addedVertices = parsedGraph.MakeEdgesDistinct()
+	// create map relation --> list of vertices, e.g. {a:[v1,v2], b:[v1,v3]}
+	vertices := createVertexMap(hypergraph)
+	// calculate the edge costs
+	w := getEdgeCost(vertices, parseGraph, tableRowCount)
+	// init values for decomposition END
+
+	for i := 0; i < count; i++ {
+		// init channels
+		decompChans[i] = make(chan balancedGo.DecompJson, 1)
+		correctChans[i] = make(chan bool, 1)
+
+		// run task, in case of width 2, we check for containment of duplicate node names
+		decompChan := decompChans[i]
+		correctChan := correctChans[i]
+		wg.Run(func() {
+			var decomp balancedGo.DecompJson
+			var corr bool
+
+			decomp, corr = decomposeWithBalancedGoAndJoinCostsSec(parsedGraph, originalGraph, addedVertices, w, width)
+			j := 0
+			for corr && containsDuplicateNodeNamesOrEmptyBagCover(decomp.Root, make(map[string]bool)) && j < 10 { // if there are duplicate NodeNames, or empty bags or covers, redecompose
+				decomp, corr = decomposeWithBalancedGoAndJoinCostsSec(parsedGraph, originalGraph, addedVertices, w, width)
+				j++
+			}
+
+			// In case of sca, reroot decomp
+			if isSCAQuery && corr {
+				startReroot := time.Now()
+
+				decomp = rerootDecomp(decomp, coveringRelation)
+
+				// special case for SCA and root cover len > 1 --> reorder such that the covering relation is at the last position
+				if len(decomp.Root.Cover) > 1 {
+					decomp.Root.Cover = reorderRootCover(decomp, coveringRelation)
+				}
+
+				timeNeededReroot := time.Now().Sub(startReroot)
+				logutil.BgLogger().Info(fmt.Sprintf("%s %d %s %s", "Time for rerooting the secondary decomposition ", i, " : ", timeNeededReroot))
+			}
+			// In case of sca, reroot decomp end
+
+			decompChan <- decomp
+			correctChan <- corr
+		})
+
+	}
+	return &wg, decompChans, correctChans
+}
+
+// decomposeWithBalancedGo : decomposes a hypergraph of a query
+func decomposeWithBalancedGo(hypergraph string, width int) (balancedGo.DecompJson, bool) {
+	var parsedGraph balancedGo.Graph
+	parsedGraph, _ = balancedGo.GetGraph(hypergraph) // parse input Graph
+	originalGraph := parsedGraph
+	var addedVertices []int
+	addedVertices = parsedGraph.MakeEdgesDistinct()
+	var solver balancedGoAlgo.Algorithm
+
+	solver = &balancedGoAlgo.BalSepLocal{
+		K:         width,
+		Graph:     parsedGraph,
+		BalFactor: 2, // default
+	}
+
+	solver.SetGenerator(balancedGo.ParallelSearchGen{})
+
+	var decomp balancedGo.Decomp
+	decomp = solver.FindDecomp() // Calc the solution
+
+	decomp.Root.RemoveVertices(addedVertices)
+
+	if !reflect.DeepEqual(decomp, balancedGo.Decomp{}) {
+		decomp.Graph = originalGraph
+	}
+
+	decomp.RestoreSubedges()
+
+	correct := decomp.Correct(originalGraph) // is the solution correct?
+
+	return decomp.IntoJson(), correct
+}
+
+// decomposeWithBalancedGoAndJoinCosts : decomposes a hypergraph of a query, this variation also incorporates joinCosts into the computation
+func decomposeWithBalancedGoAndJoinCosts(hypergraph string, width int, tableRowCount map[string]float64) (balancedGo.DecompJson, bool) {
+	var parsedGraph balancedGo.Graph
+	var parseGraph balancedGo.ParseGraph
+
+	parsedGraph, parseGraph = balancedGo.GetGraph(hypergraph) // parse input Graph
+
+	// create map relation --> list of vertices, e.g. {a:[v1,v2], b:[v1,v3]}
+	vertices := createVertexMap(hypergraph)
+
+	// calculate the edge costs
+	w := getEdgeCost(vertices, parseGraph, tableRowCount)
+
+	originalGraph := parsedGraph
+	var addedVertices []int
+	addedVertices = parsedGraph.MakeEdgesDistinct()
+	var solver balancedGoAlgo.Algorithm
+
+	solver = &balancedGoAlgo.JCostBalSepLocal{
+		K:         width,
+		Graph:     parsedGraph,
+		BalFactor: 2, // default
+		JCosts:    w,
+	}
+
+	solver.SetGenerator(balancedGo.ParallelSearchGen{})
+
+	var decomp balancedGo.Decomp
+
+	decomp = solver.FindDecomp() // Calc the solution
+
+	decomp.Root.RemoveVertices(addedVertices)
+
+	if !reflect.DeepEqual(decomp, balancedGo.Decomp{}) {
+		decomp.Graph = originalGraph
+	}
+
+	decomp.RestoreSubedges()
+
+	correct := decomp.Correct(originalGraph) // is the solution correct?
+
+	return decomp.IntoJson(), correct
+}
+
+func getEdgeCost(vertices map[string][]string, parseGraph balancedGo.ParseGraph, tableRowCount map[string]float64) balancedGo.EdgesCostMap {
+	var w balancedGo.EdgesCostMap
+	w.Init()
+
+	for s, v := range vertices {
+		// add s, 1 --> self join
+		addEdgeCost(w, parseGraph, 1, s)
+		for s2, v2 := range vertices {
+			if s < s2 { // make sure to work on every edge once
+				if len(intersect(v, v2)) == 0 { // no intersection --> a join would lead to a cartesian product
+					// add s, s2, 100000000  (high number)
+					addEdgeCost(w, parseGraph, 100000000.0, s, s2)
+				} else if isSubset(v, v2) || isSubset(v2, v) { // there is a direct child relationship --> a join is computed relatively performantly
+					// add s, s2, 1
+					addEdgeCost(w, parseGraph, 1, s, s2)
+				} else { // there is an indirect relationship, e.g. a(v1,v2,v3), b(v0,v1)
+					// add s, s2, 1 + (1 + rowCount/10000) * (1 + rowCount/10000)
+					cost := 1.0 + (1.0+tableRowCount[s]/10000.0)*(1.0+tableRowCount[s2]/10000.0) // 1 + (1 + rowCount/10000) * (1 + rowCount/10000)
+					addEdgeCost(w, parseGraph, cost, s, s2)
+				}
+			}
+		}
+	}
+	return w
+}
+
+// addEdgeCost: add an edge cost into a edgesCostMap
+func addEdgeCost(w balancedGo.EdgesCostMap, parseGraph balancedGo.ParseGraph, cost float64, tables ...string) {
+	involvedTablesEncoded := make([]int, len(tables))
+	for index, table := range tables {
+		involvedTablesEncoded[index] = parseGraph.Encoding[table]
+	}
+	sort.Ints(involvedTablesEncoded)
+	w.Put(involvedTablesEncoded, cost)
+}
+
+// createVertexMap create map relation --> list of vertices, e.g. {a:[v1,v2], b:[v1,v3]}
+func createVertexMap(hypergraph string) map[string][]string {
+	vertices := make(map[string][]string)
+	lines := strings.Split(hypergraph, "\n")
+	for _, line := range lines {
+		spLine := strings.Split(line, "(")
+		l := spLine[1]
+		if len(l) > 1 {
+			l = l[:len(l)-1]
+			if l != "" {
+				vertices[spLine[0]] = strings.Split(l, ",")
+			}
+		}
+	}
+	return vertices
+}
+
+// decomposeWithBalancedGoAndJoinCostsSec : decomposes a hypergraph of a query with the graph already prepared
+func decomposeWithBalancedGoAndJoinCostsSec(parsedGraph balancedGo.Graph, originalGraph balancedGo.Graph, addedVertices []int, w balancedGo.EdgesCostMap, width int) (balancedGo.DecompJson, bool) {
+	var solver balancedGoAlgo.Algorithm
+
+	solver = &balancedGoAlgo.JCostBalSepLocal{
+		K:         width,
+		Graph:     parsedGraph,
+		BalFactor: 2, // default
+		JCosts:    w,
+	}
+
+	solver.SetGenerator(balancedGo.ParallelSearchGen{})
+
+	var decomp balancedGo.Decomp
+
+	decomp = solver.FindDecomp() // Calc the solution
+
+	decomp.Root.RemoveVertices(addedVertices)
+
+	if !reflect.DeepEqual(decomp, balancedGo.Decomp{}) {
+		decomp.Graph = originalGraph
+	}
+
+	decomp.RestoreSubedges()
+
+	correct := decomp.Correct(originalGraph) // is the solution correct?
+
+	return decomp.IntoJson(), correct
+}
+
+// Get the number of Unique ColumnNameExpressions in the slice of ast.BinaryOperationExpr
+func numberOfUniqueConditionSides(eq []*ast.BinaryOperationExpr) int {
+	sides := make(map[string]bool)
+	for _, e := range eq {
+		sides[e.L.(*ast.ColumnNameExpr).Name.Table.L+"."+e.L.(*ast.ColumnNameExpr).Name.Name.L] = true
+		sides[e.R.(*ast.ColumnNameExpr).Name.Table.L+"."+e.R.(*ast.ColumnNameExpr).Name.Name.L] = true
+	}
+	return len(sides)
+}
+
+// Check if all the preconditions and restrictions for using a yannakakis join are fulfilled.
+// The statement has to have this form: select [1|*] from [tableList] where [joinconditions] [other conditions (<, <=, =, >=, >), with concrete values on the right side]
+// Alternatively, SCA Queries are allowed: select [[min|max](...), ...] from [tableList] where [joinconditions] [otherconditions] group by [groupingcolumns]
+// In SCA queries, all columns and groupingcolumns have to be based in the same table
+// Returns: isCaseForYannakakis, isSCA, coveringRelation
+func isCaseForYannakakis(sel *ast.SelectStmt) (bool, bool, string) {
+	// YAN_NORMAL hint? then not a case for Yannakakis
+	if sel.TableHints != nil && len(sel.TableHints) > 0 && sel.TableHints[0].HintName.L == HintYannakakisNormal {
+		return false, false, ""
+	}
+
+	ret := true
+	// FROM is set
+	ret = ret && sel.From != nil
+	// FROM contains a join
+	_, ok := sel.From.TableRefs.Left.(*ast.Join)
+	ret = ret && ok
+	// LEFT and RIGHT TableRefs are present --> at least a join of two tables
+	ret = ret && sel.From.TableRefs.Left != nil
+	ret = ret && sel.From.TableRefs.Right != nil
+	// Wildcard fields mask present
+	ret = ret && len(sel.Fields.Fields) > 0
+	sca, coveringRelation := isSCAQuery(sel)
+	ret = ret && (sel.Fields.Fields[0].WildCard != nil || sel.Fields.Fields[0].Text() == "1" || sca)
+
+	// WHERE: Only = conditions, and on both sides table references of tables included in the from, or on one side a table reference and a value on the other side
+	ret = ret && sel.Where != nil
+	whereExpression, whereOk := sel.Where.(*ast.BinaryOperationExpr)
+	ret = ret && whereOk
+
+	ret = ret && checkWhereforYannakakis(whereExpression, getListOfTables(sel.From.TableRefs))
+
+	// NO Group BY OR sca
+	ret = ret && (sel.GroupBy == nil || sca)
+	// NO WITH....
+	ret = ret && sel.Limit == nil
+	ret = ret && sel.Having == nil
+	ret = ret && sel.Distinct == false
+	ret = ret && sel.OrderBy == nil
+	ret = ret && sel.WindowSpecs == nil
+	ret = ret && sel.With == nil
+	return ret, sca, coveringRelation
+}
+
+// Check if the query is an SCA Query
+// SCA Queries are allowed: select [[min|max](...), ...] from [tableList] where [joinconditions] [otherconditions] group by [groupingcolumns]
+// In SCA queries, all columns and groupingcolumns have to be based in the same table
+// The coveringRelation is the relation in which the relevant columns are based
+// Returns: isSCA, coveringRelation
+func isSCAQuery(sel *ast.SelectStmt) (bool, string) {
+	if len(sel.Fields.Fields) > 0 {
+		allFromSameRelation := true
+		coveringRelation := ""
+		containsAgg := false
+		for _, field := range sel.Fields.Fields {
+			aggExp, aggOk := field.Expr.(*ast.AggregateFuncExpr) // try cast expr to aggFuncExpr --> in case of an agg function
+			colnExp, colnOk := field.Expr.(*ast.ColumnNameExpr)  // try cast expr to ColumnNameExpr --> in case of an normal column
+
+			if aggOk { // Aggfunction column
+
+				// check type of agg function
+				aggFunc := strings.ToLower(aggExp.F)
+				if (strings.Compare(aggFunc, "min") == 0) || (strings.Compare(aggFunc, "max") == 0) { // min and max are allowed
+					containsAgg = true
+				} else {
+					return false, "" // unknown/unallowed agg
+				}
+
+				// check column inside the aggfunction
+				colExp, colOk := aggExp.Args[0].(*ast.ColumnNameExpr)
+				if colOk {
+					if len(colExp.Name.Table.L) > 0 { // only accept if table name is annotated as colexp
+						if len(coveringRelation) == 0 { // coveringRelation not set yet --> set
+							coveringRelation = colExp.Name.Table.L
+						} else { // else check coveringRelation equal to previous
+							allFromSameRelation = allFromSameRelation && (strings.Compare(coveringRelation, colExp.Name.Table.L) == 0)
+						}
+					} else { // table is not annotated --> do not accept
+						return false, ""
+					}
+
+				} else { // is not a ColumnNameExpr --> not a sca query
+					return false, ""
+				}
+			} else if colnOk { // Normal column
+				if len(colnExp.Name.Table.L) > 0 { // only accept if table name is annotated as colexp
+					if len(coveringRelation) == 0 { // coveringRelation not set yet --> set
+						coveringRelation = colnExp.Name.Table.L
+					} else { // else check coveringRelation equal to previous
+						allFromSameRelation = allFromSameRelation && (strings.Compare(coveringRelation, colnExp.Name.Table.L) == 0)
+					}
+				} else { // table is not annotated --> do not accept
+					return false, ""
+				}
+			} else { // is not a ColumnNameExpr or AggregateFuncExpr --> not a sca query
+				return false, ""
+			}
+		}
+
+		// check grouping columns
+		if sel.GroupBy != nil {
+			for _, gbyItem := range sel.GroupBy.Items {
+				gbyColnExp, gbyColnOk := gbyItem.Expr.(*ast.ColumnNameExpr) // try cast expr to ColumnNameExpr
+				if gbyColnOk {
+					if len(gbyColnExp.Name.Table.L) > 0 { // only accept if table name is annotated as colexp
+						if len(coveringRelation) == 0 { // coveringRelation not set yet --> set
+							coveringRelation = gbyColnExp.Name.Table.L
+						} else { // else check coveringRelation equal to previous
+							allFromSameRelation = allFromSameRelation && (strings.Compare(coveringRelation, gbyColnExp.Name.Table.L) == 0)
+						}
+					} else { // table is not annotated --> do not accept
+						return false, ""
+					}
+				} else { // not a ColumnNameExpr
+					return false, "" // table is not annotated --> do not accept
+				}
+			}
+		}
+
+		return allFromSameRelation && containsAgg, coveringRelation
+	}
+	return false, ""
+}
+
+// Recursively build a list of all tables given in the *ast.Join
+func getListOfTables(tableRefs *ast.Join) []string {
+	var tableList []string
+
+	leftJoin, leftJoinOk := tableRefs.Left.(*ast.Join)
+	leftTable, leftTableOk := tableRefs.Left.(*ast.TableSource)
+	if leftJoinOk { // Is a *ast.Join
+		tableList = append(tableList, getListOfTables(leftJoin)...)
+	} else if leftTableOk { // Is a *ast.TableSource
+		tableList = append(tableList, leftTable.Source.(*ast.TableName).Name.L)
+	}
+
+	rightJoin, rightJoinOk := tableRefs.Right.(*ast.Join)
+	rightTable, rightTableOk := tableRefs.Right.(*ast.TableSource)
+	if rightJoinOk { // Is a *ast.Join
+		tableList = append(tableList, getListOfTables(rightJoin)...)
+	} else if rightTableOk { // Is a *ast.TableSource
+		tableList = append(tableList, rightTable.Source.(*ast.TableName).Name.L)
+	}
+
+	return tableList
+}
+
+// Recursively build and populate a map of all tableSources for tables given in the *ast.Join
+func getMapOfTableSources(tableRefs *ast.Join, tableSources map[string]*ast.TableSource) {
+
+	leftJoin, leftJoinOk := tableRefs.Left.(*ast.Join)
+	leftTable, leftTableOk := tableRefs.Left.(*ast.TableSource)
+	if leftJoinOk { // Is a *ast.Join
+		getMapOfTableSources(leftJoin, tableSources)
+	} else if leftTableOk { // Is a *ast.TableSource
+		tableSources[leftTable.Source.(*ast.TableName).Name.L] = leftTable
+	}
+
+	rightJoin, rightJoinOk := tableRefs.Right.(*ast.Join)
+	rightTable, rightTableOk := tableRefs.Right.(*ast.TableSource)
+	if rightJoinOk { // Is a *ast.Join
+		getMapOfTableSources(rightJoin, tableSources)
+	} else if rightTableOk { // Is a *ast.TableSource
+		tableSources[rightTable.Source.(*ast.TableName).Name.L] = rightTable
+	}
+}
+
+// check the where clause
+// Either left and right are part of an EQ, and are ColumnNameExpressions and both tables are included in the tableList (EQ Implies ...)
+// Or left and right are part of an LogicAnd, and are BinaryOperationExpr (LogicAnd Implies ...)
+// Recursively call for child expressions (of LogicAnd Expressions)
+// Also allowed: left as ColummnNameExpr [<|<=|=|>=|>] ValueExpr
+func checkWhereforYannakakis(whereExpression *ast.BinaryOperationExpr, tableList []string) bool {
+
+	whereBoolean := false
+
+	leftExpr, leftCast := whereExpression.L.(*ast.ColumnNameExpr)
+	rightExpr, rightCast := whereExpression.R.(*ast.ColumnNameExpr)
+	whereBoolean = whereBoolean || (!(whereExpression.Op == opcode.EQ) || ((leftCast && slices.Contains(tableList, leftExpr.Name.Table.L)) && (rightCast && slices.Contains(tableList, rightExpr.Name.Table.L) /* IN tables*/)))
+
+	leftExpr1, leftCast1 := whereExpression.L.(*ast.ColumnNameExpr)
+	_, rightCast1 := whereExpression.R.(*driver.ValueExpr)
+	whereBoolean = whereBoolean || (!(whereExpression.Op == opcode.EQ || whereExpression.Op == opcode.GE || whereExpression.Op == opcode.GT || whereExpression.Op == opcode.LE || whereExpression.Op == opcode.LT) || ((leftCast1 && slices.Contains(tableList, leftExpr1.Name.Table.L)) && (rightCast1)))
+
+	leftExpr2, leftCast2 := whereExpression.L.(*ast.BinaryOperationExpr)
+	rightExpr2, rightCast2 := whereExpression.R.(*ast.BinaryOperationExpr)
+
+	whereBoolean = whereBoolean || (!(whereExpression.Op == opcode.LogicAnd) || (leftCast2 && rightCast2))
+
+	if leftCast2 {
+		whereBoolean = whereBoolean && checkWhereforYannakakis(leftExpr2, tableList)
+	}
+	if rightCast2 {
+		whereBoolean = whereBoolean && checkWhereforYannakakis(rightExpr2, tableList)
+	}
+	return whereBoolean
+
+}
+
+// (Recursively) Get a slice of all *ast.BinaryOperationExpr of type opcode.EQ and L and R consisting of *ast.ColumnNameExpression
+func getEQConditionsList(whereExpression *ast.BinaryOperationExpr) (ret []*ast.BinaryOperationExpr) {
+	_, leftCast := whereExpression.L.(*ast.ColumnNameExpr)
+	_, rightCast := whereExpression.R.(*ast.ColumnNameExpr)
+	if whereExpression != nil && whereExpression.Op == opcode.EQ && leftCast && rightCast {
+		ret = append(ret, whereExpression)
+	}
+
+	leftExpr2, leftCast2 := whereExpression.L.(*ast.BinaryOperationExpr)
+	rightExpr2, rightCast2 := whereExpression.R.(*ast.BinaryOperationExpr)
+
+	if leftCast2 {
+		ret = append(ret, getEQConditionsList(leftExpr2)...)
+	}
+	if rightCast2 {
+		ret = append(ret, getEQConditionsList(rightExpr2)...)
+	}
+	return ret
+
+}
+
+// buildLogicalPlanFromDecomposition: Build a logical plan from a decomposition, based on Yannakakis algorithm
+func (b *PlanBuilder) buildLogicalPlanFromDecomposition(ctx context.Context, decomp balancedGo.DecompJson, hgmMap map[int][]string, tableSources map[string]*ast.TableSource, whereExpressionNodes []ast.ExprNode, isExistentialQuery bool, isSCAQuery bool, sel *ast.SelectStmt, selectionExpressions []ast.ExprNode, tablesContainedAsCrossproducts []string, width int) (p LogicalPlan, err error) {
+	// init datastructures for saving subplans
+	b.cteSubplans = make(map[int]map[string]LogicalPlan)
+	for i := 0; i <= 2; i++ {
+		b.cteSubplans[i] = make(map[string]LogicalPlan)
+	}
+	b.subplans = make(map[string]LogicalPlan)
+	b.optFlag = b.optFlag | flagPrunColumns | flagPredicatePushDown
+
+	p, err = b.buildPlanBottomUpWithDecompTreeTraversal(ctx, decomp.Root, hgmMap, tableSources, whereExpressionNodes, selectionExpressions, true, true) // !(isExistentialQuery || isSCAQuery)) // optimize with storeCTEs = false for these?
+	if err != nil {
+		return nil, err
+	}
+
+	if isExistentialQuery || isSCAQuery { // For an existential or SCA query (select 1 from ...) --> build cross/cartesian products immediately
+		if len(tablesContainedAsCrossproducts) > 0 {
+			p, err = b.buildCrossProductJoin(ctx, p, tableSources, tablesContainedAsCrossproducts, selectionExpressions)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if isExistentialQuery { // For an existential query (select 1 from ...), add a projection with the selectField from the selectStatement and return the plan
+		p, _, _, err = b.buildProjection(ctx, p, sel.Fields.Fields, make(map[*ast.AggregateFuncExpr]int), nil, false, false)
+		return p, err
+	}
+
+	if isSCAQuery { // For an SCA query (select max/min(...), ... from ...), add an aggregation and projection with the selectField from the selectStatement and return the plan
+
+		// Proj --> Agg --> Proj
+		fcpy := sel.Fields.Fields
+		newF := make([]*ast.SelectField, len(sel.Fields.Fields), len(sel.Fields.Fields))
+		newFInd := 0
+		chInd := 0
+		var prevTN model.CIStr
+		for _, field := range fcpy {
+			if f, ok := field.Expr.(*ast.AggregateFuncExpr); ok {
+				cne := f.Args[0].(*ast.ColumnNameExpr)
+				for _, name := range p.OutputNames() {
+					if name.OrigTblName.L == cne.Name.Table.L && name.OrigColName.L == cne.Name.Name.L {
+						prevTN = cne.Name.Table
+						name.TblName = model.NewCIStr("SEL")
+						cne.Name.Table = model.NewCIStr("SEL")
+						chInd = newFInd
+					}
+				}
+				newF[newFInd] = &ast.SelectField{Expr: cne}
+			} else if _, ok := field.Expr.(*ast.ColumnNameExpr); ok {
+				newF[newFInd] = field
+			}
+			newFInd++
+		}
+		p, _, _, err = b.buildProjection(ctx, p, newF, make(map[*ast.AggregateFuncExpr]int), nil, false, false)
+		var aggFuncs []*ast.AggregateFuncExpr
+		var totalMap map[*ast.AggregateFuncExpr]int
+		var gbyCols []expression.Expression
+
+		if sel.GroupBy != nil {
+			p, gbyCols, err = b.resolveGbyExprs(ctx, p, sel.GroupBy, fcpy)
+			if err != nil {
+				return nil, err
+			}
+		}
+		aggFuncs, totalMap = b.extractAggFuncsInSelectFields(fcpy)
+
+		var aggIndexMap map[int]int
+		p, aggIndexMap, err = b.buildAggregation(ctx, p, aggFuncs, gbyCols, make(map[*ast.AggregateFuncExpr]int))
+		if err != nil {
+			return nil, err
+		}
+		for agg, idx := range totalMap {
+			totalMap[agg] = aggIndexMap[idx]
+		}
+
+		p, _, _, err = b.buildProjection(ctx, p, sel.Fields.Fields, totalMap, nil, false, false)
+
+		// reset sel tablename
+		sel.Fields.Fields[chInd].Expr.(*ast.AggregateFuncExpr).Args[0].(*ast.ColumnNameExpr).Name.Table = prevTN
+		return p, err
+	}
+
+	p, err = b.buildPlanTopDownWithDecompTreeTraversal(ctx, decomp.Root, hgmMap, tableSources, whereExpressionNodes, p, true, selectionExpressions, true)
+	if err != nil {
+		return nil, err
+	}
+
+	p, err = b.buildPlanJoinPhaseWithDecompTreeTraversal(ctx, decomp.Root, hgmMap, tableSources, whereExpressionNodes, p, true, true, (width > 1))
+	if err != nil {
+		return nil, err
+	}
+
+	if len(tablesContainedAsCrossproducts) > 0 {
+		p, err = b.buildCrossProductJoin(ctx, p, tableSources, tablesContainedAsCrossproducts, selectionExpressions)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Project duplicate columns away
+
+	p, err = b.projectRemoveDuplicateColumns(ctx, p, err)
+	if err != nil {
+		return nil, err
+	}
+
+	return p, nil
+}
+
+// projectRemoveDuplicateColumns Project duplicate columns (and _tidb_rowid) away
+func (b *PlanBuilder) projectRemoveDuplicateColumns(ctx context.Context, p LogicalPlan, err error) (LogicalPlan, error) {
+	fields := make([]*ast.SelectField, len(p.OutputNames()))
+	fieldsSeen := make(map[string]bool)
+	fieldIndex := 0
+	var key string
+	for _, on := range p.OutputNames() {
+		// Add origTableNames to Colname, otherwise there are ambiguous entries(duplicates, such that they cannot be uniquely found)
+		on.ColName = model.NewCIStr(on.OrigTblName.O + "." + on.ColName.O)
+		// Add origTableNames to Colname, otherwise there are ambiguous entries(duplicates, such that they cannot be uniquely found) END
+
+		if on.ColName.L == on.OrigTblName.L+"._tidb_rowid" { // exclude _tidb_rowid columns
+			continue
+		}
+
+		key = on.OrigTblName.L + "." + on.OrigColName.L
+		if fieldsSeen[key] { // exclude duplicate columns
+			continue
+		}
+		fieldsSeen[key] = true
+		fields[fieldIndex] = &ast.SelectField{Expr: &ast.ColumnNameExpr{Name: &ast.ColumnName{Table: on.TblName, Name: on.ColName}}}
+		fieldIndex++
+	}
+
+	p, _, _, err = b.buildProjection(ctx, p, fields[:fieldIndex], make(map[*ast.AggregateFuncExpr]int), nil, false, false)
+	return p, err
+}
+
+// buildPlanBottomUpWithDecompTreeTraversal Traverse the Nodes of the decomposition for building the bottom up semijoin phase of Yannakakis algorithm, returns the plan of the root, others are stored as cteSubplans
+func (b *PlanBuilder) buildPlanBottomUpWithDecompTreeTraversal(ctx context.Context, root balancedGo.NodeJson, hgmMap map[int][]string, tableSources map[string]*ast.TableSource, whereExpressionNodes []ast.ExprNode, selectionExpressions []ast.ExprNode, isRootNode bool, storeCTEs bool) (p LogicalPlan, err error) {
+
+	// special case for all relations being in the root node
+	if isRootNode && len(root.Cover) > 1 && len(root.Children) == 0 {
+		var currPlan LogicalPlan
+		for _, rel := range root.Cover {
+			if currPlan == nil { // For the first plan
+				currPlan, err = b.buildDataSourceOrJoinedDataSource(ctx, balancedGo.NodeJson{}, hgmMap, rel, tableSources, selectionExpressions) // node is not needed here
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				newPlan, err := b.buildDataSourceOrJoinedDataSource(ctx, balancedGo.NodeJson{}, hgmMap, rel, tableSources, selectionExpressions) // node is not needed here
+				if err != nil {
+					return nil, err
+				}
+
+				convertedExpressions, exprInd, err := b.buildExpressionsForSemijoin(ctx, root, hgmMap, root, whereExpressionNodes, currPlan, newPlan)
+				if err != nil {
+					return nil, err
+				}
+
+				currPlan, err = b.buildSemiJoin(newPlan, currPlan, convertedExpressions[0:exprInd], false, false, false) // NP SJ CP --> schema von NP
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			// save CTE Subplan
+			if storeCTEs {
+				currPlan = b.buildCTEStorePlan(currPlan, rel, 1)
+			}
+		}
+		return currPlan, nil
+	}
+	// special case for all relations being in the root node END
+
+	nodeName := getDecompTreeNodeName(root) // Name of the current Table/Tables worked on
+
+	// Open the current table as DataSource
+	currentPlan, err := b.getCTEOrDSForDecompNode(ctx, root, hgmMap, nodeName, 0, tableSources, selectionExpressions)
+	if err != nil {
+		return nil, err
+	}
+
+	// Work on the childs: get the childs DS or intermediate plan, SJ with current plan
+	for _, child := range root.Children {
+		childPlan, err := b.buildPlanBottomUpWithDecompTreeTraversal(ctx, child, hgmMap, tableSources, whereExpressionNodes, selectionExpressions, false, storeCTEs)
+		if err != nil {
+			return nil, err
+		}
+
+		convertedExpressions, exprInd, err := b.buildExpressionsForSemijoin(ctx, root, hgmMap, child, whereExpressionNodes, currentPlan, childPlan)
+		if err != nil {
+			return nil, err
+		}
+
+		currentPlan, err = b.buildSemiJoin(currentPlan, childPlan, convertedExpressions[0:exprInd], false, false, false)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(root.Children) != 0 { // If this node is not a leaf --> build a CTE
+		if storeCTEs {
+			currentPlan = b.buildCTEStorePlan(currentPlan, nodeName, 1)
+		}
+	}
+
+	// Return the current plan
+	return currentPlan, nil
+
+}
+
+// buildPlanTopDownWithDecompTreeTraversal: build the plan for the top down phase of the Yannakakis algorithm, also saves subplans and cteSubplans into b.subplans and b.cteSubplans; on the initial call, isRootNode and leftMostBranch should be true
+func (b *PlanBuilder) buildPlanTopDownWithDecompTreeTraversal(ctx context.Context, root balancedGo.NodeJson, hgmMap map[int][]string, tableSources map[string]*ast.TableSource, whereExpressionNodes []ast.ExprNode, plan LogicalPlan, leftMostBranch bool, selectionExpressions []ast.ExprNode, isRootNode bool) (LogicalPlan, error) {
+	var err error
+	// special case for all relations being in the root node
+	if isRootNode && len(root.Cover) > 1 && len(root.Children) == 0 {
+		var newPlan LogicalPlan
+		for i := len(root.Cover) - 2; i >= 0; i-- { // iterate from last but 1 element to the first
+			rel := root.Cover[i]
+
+			newPlan, err = b.getSubplanOrCTEForDecompNode(rel, 2)
+			if err != nil {
+				return nil, err
+			}
+
+			convertedExpressions, exprInd, err := b.buildExpressionsForSemijoin(ctx, root, hgmMap, root, whereExpressionNodes, plan, newPlan)
+			if err != nil {
+				return nil, err
+			}
+
+			plan, err = b.buildSemiJoin(newPlan, plan, convertedExpressions[0:exprInd], false, false, false) // NP SJ P --> schema NP
+			if err != nil {
+				return nil, err
+			}
+
+			plan = b.buildCTEStorePlan(plan, rel, 2)
+		}
+		return plan, nil
+	}
+	// special case for all relations being in the root node END
+
+	nodeName := getDecompTreeNodeName(root) // Name of the current Table/Tables worked on
+	leftMostPlan := plan
+
+	for i, child := range root.Children {
+		childNodeName := getDecompTreeNodeName(child) // Name of the child Table/Tables
+
+		if i != 0 { // not leftmost child --> use CTE for current nodes plan
+			plan, err = b.getCTEForDecompNode(nodeName, 2)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		childPlan, err := b.getCTEOrDSForDecompNode(ctx, child, hgmMap, childNodeName, 2, tableSources, selectionExpressions)
+		if err != nil {
+			return nil, err
+		}
+
+		// Build expressions for Semijoin
+		convertedExpressions, exprInd, err := b.buildExpressionsForSemijoin(ctx, root, hgmMap, child, whereExpressionNodes, childPlan, plan)
+		if err != nil {
+			return nil, err
+		}
+
+		// Build SemiJoin
+		var newplan LogicalPlan
+		newplan, err = b.buildSemiJoin(childPlan, plan, convertedExpressions[0:exprInd], false, false, false)
+		if err != nil {
+			return nil, err
+		}
+
+		// Save newplan as cte of childNode
+		newplan = b.buildCTEStorePlan(newplan, childNodeName, 2)
+
+		subplan, err := b.buildPlanTopDownWithDecompTreeTraversal(ctx, child, hgmMap, tableSources, whereExpressionNodes, newplan, (i == 0) && leftMostBranch, selectionExpressions, false)
+		if err != nil {
+			return nil, err
+		}
+
+		if i == 0 && leftMostBranch { // leftmost child ?
+			leftMostPlan = subplan
+		} else {
+			if b.subplans[childNodeName] != nil {
+				return nil, domain.ErrInfoSchemaChanged.GenWithStack("Unused Subplans!")
+			}
+			b.subplans[childNodeName] = subplan
+		}
+	}
+	return leftMostPlan, nil
+}
+
+// buildPlanJoinPhaseWithDecompTreeTraversal: build the join phase plan of Yannakakis algorithm
+func (b *PlanBuilder) buildPlanJoinPhaseWithDecompTreeTraversal(ctx context.Context, root balancedGo.NodeJson, hgmMap map[int][]string, tableSources map[string]*ast.TableSource, whereExpressionNodes []ast.ExprNode, plan LogicalPlan, leftMostBranch bool, isRootNode bool, cyclic bool) (LogicalPlan, error) {
+
+	// special case for all relations being in the root node
+	if isRootNode && len(root.Cover) > 1 && len(root.Children) == 0 {
+		for i := 1; i < len(root.Cover); i++ {
+			rel := root.Cover[i]
+
+			newPlan, err := b.getSubplanOrCTEForDecompNode(rel, 2)
+			if err != nil {
+				return nil, err
+			}
+
+			convertedExpressions, exprInd, err2 := b.buildExpressionsForSemijoin(ctx, root, hgmMap, root, whereExpressionNodes, plan, newPlan)
+			if err2 != nil {
+				return nil, err2
+			}
+			// Map expressions to *expression.ScalarFunction
+			var exp []*expression.ScalarFunction
+			exp = make([]*expression.ScalarFunction, exprInd, exprInd)
+			for j := 0; j < exprInd; j++ {
+				exp[j] = convertedExpressions[j].(*expression.ScalarFunction)
+			}
+
+			newPlan, err = b.buildInnerJoinWithExpressions(plan, newPlan, exp)
+			if err != nil {
+				return nil, err
+			}
+
+			return newPlan, nil
+		}
+	}
+	// special case for all relations being in the root node END
+
+	nodeName := getDecompTreeNodeName(root) // Name of the current Table/Tables worked on
+
+	_, ok := plan.(*LogicalCTE) // stop condition, if the cte with the right name (= leftmost bottommost node, as plan is given) is reached
+	if ok {
+		name := plan.(*LogicalCTE).cteName.L
+		if nodeName == name {
+			return plan, nil
+		}
+	}
+
+	currentPlan, err := b.getSubplanOrCTEForDecompNode(nodeName, 2)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, child := range root.Children {
+		childPlan, err := b.buildPlanJoinPhaseWithDecompTreeTraversal(ctx, child, hgmMap, tableSources, whereExpressionNodes, plan, leftMostBranch, false, cyclic)
+		if err != nil {
+			return nil, err
+		}
+
+		convertedExpressions, exprInd, err2 := b.buildExpressionsForSemijoin(ctx, root, hgmMap, child, whereExpressionNodes, childPlan, currentPlan, cyclic)
+		if err2 != nil {
+			return nil, err2
+		}
+		// Map expressions to *expression.ScalarFunction
+		var exp []*expression.ScalarFunction
+		exp = make([]*expression.ScalarFunction, exprInd, exprInd)
+		for j := 0; j < exprInd; j++ {
+			exp[j] = convertedExpressions[j].(*expression.ScalarFunction)
+		}
+
+		currentPlan, err = b.buildInnerJoinWithExpressions(childPlan, currentPlan, exp)
+		if err != nil {
+			return nil, err
+		}
+
+	}
+	return currentPlan, nil
+}
+
+// buildCrossProductJoin: Build cartesian products of all the tables in tablescontainedAsCrossproducts with the selectionExpressions, and append them to the LogicalPlan p
+// tablescontainedAsCrossproducts has to have at least one element, otherwise there will be some error or panic
+func (b *PlanBuilder) buildCrossProductJoin(ctx context.Context, p LogicalPlan, tableSources map[string]*ast.TableSource, tablesContainedAsCrossproducts []string, selectionExpressions []ast.ExprNode) (LogicalPlan, error) {
+	left, err := b.buildDataSourceIncludingSelection(ctx, tableSources, selectionExpressions, tablesContainedAsCrossproducts[0])
+	if err != nil {
+		return nil, err
+	}
+
+	for i := 1; i < len(tablesContainedAsCrossproducts); i++ {
+		right, err := b.buildDataSourceIncludingSelection(ctx, tableSources, selectionExpressions, tablesContainedAsCrossproducts[i])
+		if err != nil {
+			return nil, err
+		}
+
+		// build cartesian join
+		left, err = b.buildCartesianInnerJoin(left, right)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// build cartesian join with the given plan
+	p, err = b.buildCartesianInnerJoin(left, p)
+	return p, err
+}
+
+// Build a Datasource from the given index of the tableSources , including a selection if there are suiting expressions in the selectionExpressions
+func (b *PlanBuilder) buildDataSourceIncludingSelection(ctx context.Context, tableSources map[string]*ast.TableSource, selectionExpressions []ast.ExprNode, tableName string) (LogicalPlan, error) {
+	left, err := b.buildDataSource(ctx, tableSources[tableName].Source.(*ast.TableName), &tableSources[tableName].AsName)
+	if err != nil {
+		return nil, err
+	}
+	if len(selectionExpressions) > 0 { // are there any selectionExpressions --> add
+		left, err = b.addSelectionExpressions(ctx, left, selectionExpressions)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return left, err
+}
+
+// buildCartesianInnerJoin: Build a cartesian join of the two plans given
+func (b *PlanBuilder) buildCartesianInnerJoin(leftPlan LogicalPlan, rightPlan LogicalPlan) (LogicalPlan, error) {
+
+	b.optFlag = b.optFlag | flagPredicatePushDown
+	// Add join reorder flag regardless of inner join or outer join.
+	b.optFlag = b.optFlag | flagJoinReOrder
+
+	joinPlan := LogicalJoin{StraightJoin: false, cartesianJoin: true}.Init(b.ctx, b.getSelectOffset())
+	joinPlan.SetChildren(leftPlan, rightPlan)
+	joinPlan.SetSchema(expression.MergeSchema(leftPlan.Schema(), rightPlan.Schema()))
+	joinPlan.names = make([]*types.FieldName, leftPlan.Schema().Len()+rightPlan.Schema().Len())
+	copy(joinPlan.names, leftPlan.OutputNames())
+	copy(joinPlan.names[leftPlan.Schema().Len():], rightPlan.OutputNames())
+
+	// Set join type
+	joinPlan.JoinType = InnerJoin
+
+	// Merge sub-plan's fullSchema into this join plan.
+	// Please read the comment of LogicalJoin.fullSchema for the details.
+	var (
+		lFullSchema, rFullSchema *expression.Schema
+		lFullNames, rFullNames   types.NameSlice
+	)
+	if left, ok := leftPlan.(*LogicalJoin); ok && left.fullSchema != nil {
+		lFullSchema = left.fullSchema
+		lFullNames = left.fullNames
+	} else {
+		lFullSchema = leftPlan.Schema()
+		lFullNames = leftPlan.OutputNames()
+	}
+	if right, ok := rightPlan.(*LogicalJoin); ok && right.fullSchema != nil {
+		rFullSchema = right.fullSchema
+		rFullNames = right.fullNames
+	} else {
+		rFullSchema = rightPlan.Schema()
+		rFullNames = rightPlan.OutputNames()
+	}
+
+	// Merge schema
+	joinPlan.fullSchema = expression.MergeSchema(lFullSchema, rFullSchema)
+
+	// Merge sub-plan's fullNames into this join plan, similar to the fullSchema logic above.
+	joinPlan.fullNames = make([]*types.FieldName, 0, len(lFullNames)+len(rFullNames))
+	for _, lName := range lFullNames {
+		name := *lName
+		joinPlan.fullNames = append(joinPlan.fullNames, &name)
+	}
+	for _, rName := range rFullNames {
+		name := *rName
+		joinPlan.fullNames = append(joinPlan.fullNames, &name)
+	}
+
+	return joinPlan, nil
+}
+
+// buildInnerJoinWithExpressions: build an inner join of the leftPlan and rightPlan with the given onCondition
+func (b *PlanBuilder) buildInnerJoinWithExpressions(leftPlan LogicalPlan, rightPlan LogicalPlan, onCondition []*expression.ScalarFunction) (LogicalPlan, error) {
+
+	b.optFlag = b.optFlag | flagPredicatePushDown
+	// Add join reorder flag regardless of inner join or outer join.
+	b.optFlag = b.optFlag | flagJoinReOrder
+
+	joinPlan := LogicalJoin{StraightJoin: false, EqualConditions: onCondition}.Init(b.ctx, b.getSelectOffset())
+	joinPlan.SetChildren(leftPlan, rightPlan)
+	joinPlan.SetSchema(expression.MergeSchema(leftPlan.Schema(), rightPlan.Schema()))
+	joinPlan.names = make([]*types.FieldName, leftPlan.Schema().Len()+rightPlan.Schema().Len())
+	copy(joinPlan.names, leftPlan.OutputNames())
+	copy(joinPlan.names[leftPlan.Schema().Len():], rightPlan.OutputNames())
+
+	// Set join type
+	joinPlan.JoinType = InnerJoin
+
+	// Merge sub-plan's fullSchema into this join plan.
+	// Please read the comment of LogicalJoin.fullSchema for the details.
+	var (
+		lFullSchema, rFullSchema *expression.Schema
+		lFullNames, rFullNames   types.NameSlice
+	)
+	if left, ok := leftPlan.(*LogicalJoin); ok && left.fullSchema != nil {
+		lFullSchema = left.fullSchema
+		lFullNames = left.fullNames
+	} else {
+		lFullSchema = leftPlan.Schema()
+		lFullNames = leftPlan.OutputNames()
+	}
+	if right, ok := rightPlan.(*LogicalJoin); ok && right.fullSchema != nil {
+		rFullSchema = right.fullSchema
+		rFullNames = right.fullNames
+	} else {
+		rFullSchema = rightPlan.Schema()
+		rFullNames = rightPlan.OutputNames()
+	}
+
+	// Merge schema
+	joinPlan.fullSchema = expression.MergeSchema(lFullSchema, rFullSchema)
+
+	// Merge sub-plan's fullNames into this join plan, similar to the fullSchema logic above.
+	joinPlan.fullNames = make([]*types.FieldName, 0, len(lFullNames)+len(rFullNames))
+	for _, lName := range lFullNames {
+		name := *lName
+		joinPlan.fullNames = append(joinPlan.fullNames, &name)
+	}
+	for _, rName := range rFullNames {
+		name := *rName
+		joinPlan.fullNames = append(joinPlan.fullNames, &name)
+	}
+
+	return joinPlan, nil
+}
+
+// getSubplanOrCTEForDecompNode: get a subplan or a cteSubplan for a decomposition node. name is the name of the node, and i is the level/phase to get the plan for
+func (b *PlanBuilder) getSubplanOrCTEForDecompNode(name string, i int) (LogicalPlan, error) {
+	if b.subplans[name] != nil {
+		subplan := b.subplans[name]
+		b.subplans[name] = nil
+		return subplan, nil
+	}
+	return b.getCTEForDecompNode(name, i)
+
+}
+
+// getCTEForDecompNode: get a cteSubplan for a decomposition node. name is the name of the node, and i is the level/phase to get the plan for
+func (b *PlanBuilder) getCTEForDecompNode(name string, phase int) (LogicalPlan, error) {
+	if b.cteSubplans[phase][name] == nil { // recursively search the phases
+		if phase == -1 {
+			return nil, domain.ErrInfoSchemaChanged.GenWithStack("No CTE Subplan found!")
+		}
+		return b.getCTEForDecompNode(name, phase-1)
+	}
+
+	return b.cteSubplans[phase][name], nil
+
+}
+
+// getCTEOrDSForDecompNode: get a cteSubplan or a Datasource (if no cte subplan exists) for the given Hypertree node
+func (b *PlanBuilder) getCTEOrDSForDecompNode(ctx context.Context, node balancedGo.NodeJson, hgmMap map[int][]string, name string, phase int, tableSources map[string]*ast.TableSource, selectionExpressions []ast.ExprNode) (LogicalPlan, error) {
+	if b.cteSubplans[phase][name] == nil { // recursively search the phases
+		if phase == -1 {
+			return b.buildDataSourceOrJoinedDataSource(ctx, node, hgmMap, name, tableSources, selectionExpressions)
+		}
+		return b.getCTEOrDSForDecompNode(ctx, node, hgmMap, name, phase-1, tableSources, selectionExpressions)
+	}
+
+	return b.cteSubplans[phase][name], nil
+}
+
+// buildDataSourceOrJoinedDataSource: build a Datasource, or a joined datasource (in case the node cover has more than 1 element), with the matching selectionExpressions
+func (b *PlanBuilder) buildDataSourceOrJoinedDataSource(ctx context.Context, node balancedGo.NodeJson, hgmMap map[int][]string, name string, tableSources map[string]*ast.TableSource, selectionExpressions []ast.ExprNode) (LogicalPlan, error) {
+	tables := strings.Split(name, " X ")
+	if len(tables) > 1 {
+
+		involvedCols := make(map[int]map[string]bool) // Map col --> bool(used)
+		count := 0
+		for _, content := range node.Bag { // go over all vertices in the Bag for the node
+
+			i, err := strconv.Atoi(strings.Replace(content, "v", "", -1)) // remove the v and parse into int
+			if err == nil {
+				for _, col := range hgmMap[i] { // go over all cols in this vertex
+					if involvedCols[count] == nil { // initialize if neccesary
+						involvedCols[count] = make(map[string]bool)
+					}
+					involvedCols[count][col] = true // mark col as involved in this child (and semijoin with the parent)
+				}
+			}
+
+			count++
+		}
+
+		var currentPlan LogicalPlan
+		var err error
+
+		for i := 1; i < len(tables); i++ { // work in pairs here
+
+			// buildDataSources
+			if currentPlan == nil {
+				currentPlan, err = b.buildDataSource(ctx, tableSources[tables[0]].Source.(*ast.TableName), &tableSources[tables[0]].AsName)
+				if err != nil {
+					return nil, err
+				}
+				currentPlan, err = b.addSelectionExpressions(ctx, currentPlan, selectionExpressions)
+				if err != nil {
+					return nil, err
+				}
+			}
+			right, err := b.buildDataSource(ctx, tableSources[tables[i]].Source.(*ast.TableName), &tableSources[tables[i]].AsName)
+			if err != nil {
+				return nil, err
+			}
+			right, err = b.addSelectionExpressions(ctx, right, selectionExpressions)
+			if err != nil {
+				return nil, err
+			}
+
+			// get join on expressions for the two plans
+			convertedExpressions := make([]expression.Expression, 2, 2)
+			exprInd := 0
+
+			// Create a plan with the whole schema for using during rewriting the expression
+			pseudoJoinPlanForExpressionRewriter := LogicalJoin{StraightJoin: false}.Init(b.ctx, b.getSelectOffset())
+			pseudoJoinPlanForExpressionRewriter.SetChildren(currentPlan, right)
+			pseudoJoinPlanForExpressionRewriter.SetSchema(expression.MergeSchema(currentPlan.Schema(), right.Schema()))
+
+			// collect Tables and Outputnames in the plan
+			tablesInPseudoPlan := make(map[string]bool)
+
+			// Nonunique tbl.col across both sides and per side?
+			nonUniqueBothSides, nonUniqueLeft, nonUniqueRight := checkNonUniqueTblCol(currentPlan.OutputNames(), right.OutputNames())
+
+			var pJPON types.NameSlice // pseudoJoinPlanoutputNames
+			for _, on := range currentPlan.OutputNames() {
+				tableList := strings.Split(on.TblName.L, " x ")
+				if len(tableList) > 1 {
+					for _, e := range tableList {
+						tablesInPseudoPlan[e] = true
+					}
+				} else {
+					tablesInPseudoPlan[on.TblName.L] = true
+				}
+
+				if nonUniqueLeft && on.OrigColName.L != "_tidb_rowid" { // do we have to add a prefix to the colname?, otherwise add unchanged
+					prefix := ""
+					if nonUniqueBothSides {
+						prefix = "1."
+					}
+					clonedOn := clone.Clone(on)
+					clonedOn.ColName = model.NewCIStr(prefix + clonedOn.OrigTblName.O + "." + clonedOn.ColName.O)
+					pJPON = append(pJPON, clonedOn)
+				} else if nonUniqueBothSides && on.OrigColName.L != "_tidb_rowid" {
+					clonedOn := clone.Clone(on)
+					clonedOn.ColName = model.NewCIStr("1." + clonedOn.ColName.O)
+					pJPON = append(pJPON, clonedOn)
+				} else {
+					pJPON = append(pJPON, on)
+				}
+			}
+
+			for _, on := range right.OutputNames() {
+				tableList := strings.Split(on.TblName.L, " x ")
+				if len(tableList) > 1 {
+					for _, e := range tableList {
+						tablesInPseudoPlan[e] = true
+					}
+				} else {
+					tablesInPseudoPlan[on.TblName.L] = true
+				}
+
+				if nonUniqueRight && on.OrigColName.L != "_tidb_rowid" { // do we have to add a prefix to the colname?, otherwise add unchanged
+					prefix := ""
+					if nonUniqueBothSides {
+						prefix = "2."
+					}
+					clonedOn := clone.Clone(on)
+					clonedOn.ColName = model.NewCIStr(prefix + clonedOn.OrigTblName.O + "." + clonedOn.ColName.O)
+					pJPON = append(pJPON, clonedOn)
+				} else if nonUniqueBothSides && on.OrigColName.L != "_tidb_rowid" {
+					clonedOn := clone.Clone(on)
+					clonedOn.ColName = model.NewCIStr("2." + clonedOn.ColName.O)
+					pJPON = append(pJPON, clonedOn)
+				} else {
+					pJPON = append(pJPON, on)
+				}
+			}
+
+			// Set OutputNames in the pseudoplan
+			pseudoJoinPlanForExpressionRewriter.SetOutputNames(pJPON)
+
+			// Expressions, also including transitive dependencies
+			// Collect all table.col for this equality (filter the involvedCols for the tables available in the join)
+			for _, cols := range involvedCols {
+
+				var conds []string // In here, there are all table.col which have to be equal to each other
+				for tbl, _ := range cols {
+					if tablesInPseudoPlan[strings.SplitN(tbl, ".", 2)[0]] == true { // If a involvedCols table is in the pseudoplans tables
+						conds = append(conds, tbl)
+					}
+				}
+
+				// Build expressions
+				if len(conds) > 1 { // only build expressions, if there is at least one pair
+					for i := 0; i < len(conds)-1; i++ { // len-1 because we work with pairs 0-1, 1-2, ...
+						origExpr := b.templateEQExpression // get template
+						cloned := clone.Clone(origExpr)    // clone template
+
+						// if lefttable in currentschema and righttable in rightschema this, otherwise other way around
+						leftTable := strings.SplitN(conds[i], ".", 2)
+						rightTable := strings.SplitN(conds[i+1], ".", 2)
+
+						// If the sides are not ok, change
+						if slice.AnyOf(currentPlan.OutputNames(), func(i int) bool { // And to be sure, check if the basic case is ok
+							return currentPlan.OutputNames()[i].OrigTblName.L == strings.ToLower(leftTable[0])
+						}) && slice.AnyOf(right.OutputNames(), func(i int) bool {
+							return right.OutputNames()[i].OrigTblName.L == strings.ToLower(rightTable[0])
+						}) {
+							leftTable, rightTable = leftTable, rightTable // keep sides
+						} else if slice.AnyOf(currentPlan.OutputNames(), func(i int) bool { // Check if the sides have to be switched
+							return currentPlan.OutputNames()[i].OrigTblName.L == strings.ToLower(rightTable[0])
+						}) && slice.AnyOf(right.OutputNames(), func(i int) bool {
+							return right.OutputNames()[i].OrigTblName.L == strings.ToLower(leftTable[0])
+						}) {
+							leftTable, rightTable = rightTable, leftTable // change sides
+						} else {
+							// Could not match join conditions to either side of the join
+							continue
+						}
+
+						// Add prefix in case there is a nonunique column name across the sides
+						prefix1, prefix2 := "", ""
+						if nonUniqueBothSides {
+							prefix1 = "1."
+							prefix2 = "2."
+						}
+						// change the clone --> Build ast.BinaryOperationExpr (but keep the type as ast.ExprNode)
+						cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(leftTable[0])
+						cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(prefix1 + leftTable[1])
+
+						cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(rightTable[0])
+						cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(prefix2 + rightTable[1])
+
+						// Fix table names/alias for y X b CTEs
+						var leftOrigTblName, rightOrigTblName string
+						// left:
+						expressionTblName := strings.ToLower(leftTable[0])
+						expressionColName := strings.ToLower(leftTable[1])
+						for _, on := range currentPlan.OutputNames() {
+							// origTblName is not empty (exclude _tidb_rowid) && this column matches the expression in table and column name && there exists an alias for the column
+							if on.OrigTblName.L != "" && on.OrigTblName.L == expressionTblName && on.OrigColName.L == expressionColName && on.OrigTblName.L != on.TblName.L {
+								leftOrigTblName = cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Table.O
+								// set the alias name as tblName in the expression
+								cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(on.TblName.L)
+								break
+							}
+						}
+
+						// same for right:
+						expressionTblName = strings.ToLower(rightTable[0])
+						expressionColName = strings.ToLower(rightTable[1])
+						for _, on := range right.OutputNames() {
+							// origTblName is not empty (exclude _tidb_rowid) && this column matches the expression in table and column name && there exists an alias for the column
+							if on.OrigTblName.L != "" && on.OrigTblName.L == expressionTblName && on.OrigColName.L == expressionColName && on.OrigTblName.L != on.TblName.L {
+								rightOrigTblName = cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Table.O
+								// set the alias name as tblName in the expression
+								cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(on.TblName.L)
+								break
+							}
+						}
+
+						// Fix table names/alias for y X b CTEs END
+
+						// set right and left orig table name in case they are not set yet (may be the case when the side is nonunique, but is not composed of an a X b)
+						if leftOrigTblName == "" {
+							leftOrigTblName = cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Table.O
+						}
+						if rightOrigTblName == "" {
+							rightOrigTblName = cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Table.O
+						}
+						// set right and left orig table name in case they are not set yet END
+
+						// Fix prefix at the expression colname
+						if nonUniqueBothSides { // HERE: <NR>.<ORIGTBLNAME>.<COLNAME>
+							if nonUniqueLeft {
+								sp := strings.Split(cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name.O, ".")
+								cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(sp[0] + "." + leftOrigTblName + "." + sp[1])
+							}
+
+							if nonUniqueRight {
+								sp := strings.Split(cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name.O, ".")
+								cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(sp[0] + "." + rightOrigTblName + "." + sp[1])
+							}
+						} else { // HERE: <ORIGTBLNAME>.<COLNAME>
+							if nonUniqueLeft {
+								cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(leftOrigTblName + "." + cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name.O)
+							}
+
+							if nonUniqueRight {
+								cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(rightOrigTblName + "." + cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name.O)
+							}
+						}
+
+						// convert to expression.Expression
+						expr, _ /*np*/, err := b.rewrite(ctx, cloned, pseudoJoinPlanForExpressionRewriter, nil, false)
+						if err != nil {
+							return nil, err
+						}
+						if expr != nil {
+
+							// check if the slice needs to be extended and do so if needed
+							if exprInd == len(convertedExpressions) {
+								extended := make([]expression.Expression, len(convertedExpressions)*2, len(convertedExpressions)*2)
+								copy(extended, convertedExpressions)
+								convertedExpressions = extended
+							}
+
+							// Add to the list of expressions for the semijoin
+							convertedExpressions[exprInd] = expr
+							exprInd++
+						}
+
+					}
+				}
+			}
+
+			// Map expressions to *expression.ScalarFunction
+			var exp []*expression.ScalarFunction
+			exp = make([]*expression.ScalarFunction, exprInd, exprInd)
+			for j := 0; j < exprInd; j++ {
+				exp[j] = convertedExpressions[j].(*expression.ScalarFunction)
+			}
+
+			// get join on expressions for the two plans END
+
+			// join
+			currentPlan, err = b.buildInnerJoinWithExpressions(currentPlan, right, exp)
+			if err != nil {
+				return nil, err
+			}
+
+		}
+
+		return currentPlan, nil
+
+	} else { // only one table
+		p, err := b.buildDataSource(ctx, tableSources[name].Source.(*ast.TableName), &tableSources[name].AsName)
+		if err != nil {
+			return nil, err
+		}
+		return b.addSelectionExpressions(ctx, p, selectionExpressions)
+	}
+
+}
+
+// addSelectionExpressions: Add the given selection expressions with a LogicalSelection on top of the given LogicalPlan
+func (b *PlanBuilder) addSelectionExpressions(ctx context.Context, plan LogicalPlan, selectionExpressions []ast.ExprNode) (LogicalPlan, error) {
+	b.optFlag |= flagPredicatePushDown
+
+	// Get the tables in the current plan
+	tablesInPlan := make(map[string]bool)
+
+	for _, on := range plan.OutputNames() {
+		tablesInPlan[on.TblName.L] = true
+	}
+
+	// Get the applying selections for the plan
+	convertedExpressions := make([]expression.Expression, len(selectionExpressions), len(selectionExpressions))
+	exprInd := 0
+	for _, ex := range selectionExpressions {
+		colNameExpr, ok := ex.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr)
+		if ok && tablesInPlan[colNameExpr.Name.Table.L] {
+
+			// convert to expression.Expression
+			expr, _ /*np*/, err := b.rewrite(ctx, ex, plan, nil, false)
+			if err != nil {
+				return nil, err
+			}
+			if expr != nil {
+
+				// check if the slice needs to be extended and do so if needed
+				if exprInd == len(convertedExpressions) {
+					extended := make([]expression.Expression, len(convertedExpressions)*2, len(convertedExpressions)*2)
+					copy(extended, convertedExpressions)
+					convertedExpressions = extended
+				}
+
+				// Add to the list of expressions for the semijoin
+				convertedExpressions[exprInd] = expr
+				exprInd++
+			}
+		}
+	}
+
+	sel := LogicalSelection{Conditions: convertedExpressions[:exprInd]}.Init(b.ctx, b.getSelectOffset())
+	sel.SetChildren(plan)
+
+	// Set OutputNames
+	//sel.SetOutputNames(plan.OutputNames())
+
+	if exprInd > 0 { // added a selection
+		return sel, nil
+	} else { // nothing added
+		return plan, nil
+	}
+
+}
+
+// buildExpressionsForSemijoin: build expressions for a semijoin of outerplan SJ innerplan  in Hypertree node root
+func (b *PlanBuilder) buildExpressionsForSemijoin(ctx context.Context, root balancedGo.NodeJson, hgmMap map[int][]string, child balancedGo.NodeJson, whereExpressionNodes []ast.ExprNode, outerPlan LogicalPlan, innerPlan LogicalPlan, cyclic ...bool) ([]expression.Expression, int, error) {
+
+	involvedCols := make(map[int]map[string]bool) // Map col --> bool(used)
+	count := 0
+	for _, content := range intersect(child.Bag, root.Bag) { // go over all vertices in the Bag for the child intersect bag of current root
+
+		i, err := strconv.Atoi(strings.Replace(content, "v", "", -1)) // remove the v and parse into int
+		if err == nil {
+			for _, col := range hgmMap[i] { // go over all cols in this vertex
+				if involvedCols[count] == nil { // initialize if neccesary
+					involvedCols[count] = make(map[string]bool)
+				}
+				involvedCols[count][col] = true // mark col as involved in this child (and semijoin with the parent)
+			}
+		}
+
+		count++
+	}
+
+	// get join on expressions for the two plans
+	convertedExpressions := make([]expression.Expression, len(whereExpressionNodes), len(whereExpressionNodes))
+	exprInd := 0
+
+	// Create a plan with the whole schema for using during rewriting the expression
+	pseudoJoinPlanForExpressionRewriter := LogicalJoin{StraightJoin: false}.Init(b.ctx, b.getSelectOffset())
+	pseudoJoinPlanForExpressionRewriter.SetChildren(outerPlan, innerPlan)
+	pseudoJoinPlanForExpressionRewriter.SetSchema(expression.MergeSchema(outerPlan.Schema(), innerPlan.Schema()))
+
+	// collect Tables and Outputnames in the plan
+	tablesInPseudoPlan := make(map[string]bool)
+
+	// Nonunique tbl.col across both sides and per side?
+	nonUniqueBothSides, nonUniqueLeft, nonUniqueRight := checkNonUniqueTblCol(outerPlan.OutputNames(), innerPlan.OutputNames())
+
+	var pJPON types.NameSlice // pseudoJoinPlanoutputNames
+	for _, on := range outerPlan.OutputNames() {
+		tableList := strings.Split(on.TblName.L, " x ")
+		if len(tableList) > 1 {
+			for _, e := range tableList {
+				tablesInPseudoPlan[e] = true
+			}
+		} else {
+			tablesInPseudoPlan[on.TblName.L] = true
+		}
+
+		if nonUniqueLeft && on.OrigColName.L != "_tidb_rowid" { // do we have to add a prefix to the colname?, otherwise add unchanged
+			prefix := ""
+			if nonUniqueBothSides {
+				prefix = "1."
+			}
+			clonedOn := clone.Clone(on)
+			clonedOn.ColName = model.NewCIStr(prefix + clonedOn.OrigTblName.O + "." + clonedOn.ColName.O)
+			pJPON = append(pJPON, clonedOn)
+		} else if nonUniqueBothSides && on.OrigColName.L != "_tidb_rowid" {
+			clonedOn := clone.Clone(on)
+			clonedOn.ColName = model.NewCIStr("1." + clonedOn.ColName.O)
+			pJPON = append(pJPON, clonedOn)
+		} else {
+			pJPON = append(pJPON, on)
+		}
+	}
+
+	for _, on := range innerPlan.OutputNames() {
+		tableList := strings.Split(on.TblName.L, " x ")
+		if len(tableList) > 1 {
+			for _, e := range tableList {
+				tablesInPseudoPlan[e] = true
+			}
+		} else {
+			tablesInPseudoPlan[on.TblName.L] = true
+		}
+
+		if nonUniqueRight && on.OrigColName.L != "_tidb_rowid" { // do we have to add a prefix to the colname?, otherwise add unchanged
+			prefix := ""
+			if nonUniqueBothSides {
+				prefix = "2."
+			}
+			clonedOn := clone.Clone(on)
+			clonedOn.ColName = model.NewCIStr(prefix + clonedOn.OrigTblName.O + "." + clonedOn.ColName.O)
+			pJPON = append(pJPON, clonedOn)
+		} else if nonUniqueBothSides && on.OrigColName.L != "_tidb_rowid" {
+			clonedOn := clone.Clone(on)
+			clonedOn.ColName = model.NewCIStr("2." + clonedOn.ColName.O)
+			pJPON = append(pJPON, clonedOn)
+		} else {
+			pJPON = append(pJPON, on)
+		}
+	}
+
+	// Set OutputNames in the pseudoplan
+	pseudoJoinPlanForExpressionRewriter.SetOutputNames(pJPON)
+
+	// Expressions, also including transitive dependencies
+	// Collect all table.col for this equality (filter the involvedCols for the tables available in the join)
+	for _, cols := range involvedCols { // work per vertex involvedCols
+
+		var conds []string // In here, there are all table.col which have to be equal to each other
+		for tbl, _ := range cols {
+			if tablesInPseudoPlan[strings.SplitN(tbl, ".", 2)[0]] == true { // If a involvedCols table is in the pseudoplans tables
+				conds = append(conds, tbl)
+			}
+		}
+
+		// Build expressions
+		if len(conds) > 1 { // only build expressions, if there is at least one pair
+			for i := 0; i < len(conds)-1; i++ { // len-1 because we work with pairs 0-1, 1-2, ...
+				origExpr := b.templateEQExpression // get template
+				cloned := clone.Clone(origExpr)    // clone template
+
+				// if lefttable in currentschema and righttable in rightschema this, otherwise other way around
+				leftTable := strings.SplitN(conds[i], ".", 2)
+				rightTable := strings.SplitN(conds[i+1], ".", 2)
+
+				// If the sides are not ok, change
+				if slice.AnyOf(outerPlan.OutputNames(), func(i int) bool { // And to be sure, check if the basic case is ok
+					return outerPlan.OutputNames()[i].OrigTblName.L == strings.ToLower(leftTable[0])
+				}) && slice.AnyOf(innerPlan.OutputNames(), func(i int) bool {
+					return innerPlan.OutputNames()[i].OrigTblName.L == strings.ToLower(rightTable[0])
+				}) {
+					leftTable, rightTable = leftTable, rightTable // keep sides
+				} else if slice.AnyOf(outerPlan.OutputNames(), func(i int) bool { // Check if the sides have to be switched
+					return outerPlan.OutputNames()[i].OrigTblName.L == strings.ToLower(rightTable[0])
+				}) && slice.AnyOf(innerPlan.OutputNames(), func(i int) bool {
+					return innerPlan.OutputNames()[i].OrigTblName.L == strings.ToLower(leftTable[0])
+				}) {
+					leftTable, rightTable = rightTable, leftTable // change sides
+				} else {
+					// Could not match join conditions to either side of the join
+					continue
+				}
+
+				// Add prefix in case there is a nonunique column name across the sides
+				prefix1, prefix2 := "", ""
+				if nonUniqueBothSides {
+					prefix1 = "1."
+					prefix2 = "2."
+				}
+				// change the clone --> Build ast.BinaryOperationExpr (but keep the type as ast.ExprNode)
+				cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(leftTable[0])
+				cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(prefix1 + leftTable[1])
+
+				cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(rightTable[0])
+				cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(prefix2 + rightTable[1])
+
+				// Fix table names/alias for y X b CTEs
+				var leftOrigTblName, rightOrigTblName string
+				// left:
+				expressionTblName := strings.ToLower(leftTable[0])
+				expressionColName := strings.ToLower(leftTable[1])
+				for _, on := range outerPlan.OutputNames() {
+					// origTblName is not empty (exclude _tidb_rowid) && this column matches the expression in table and column name && there exists an alias for the column
+					if on.OrigTblName.L != "" && on.OrigTblName.L == expressionTblName && on.OrigColName.L == expressionColName && on.OrigTblName.L != on.TblName.L {
+						leftOrigTblName = cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Table.O
+						// set the alias name as tblName in the expression
+						cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(on.TblName.L)
+						break
+					}
+				}
+
+				// same for right:
+				expressionTblName = strings.ToLower(rightTable[0])
+				expressionColName = strings.ToLower(rightTable[1])
+				for _, on := range innerPlan.OutputNames() {
+					// origTblName is not empty (exclude _tidb_rowid) && this column matches the expression in table and column name && there exists an alias for the column
+					if on.OrigTblName.L != "" && on.OrigTblName.L == expressionTblName && on.OrigColName.L == expressionColName && on.OrigTblName.L != on.TblName.L {
+						rightOrigTblName = cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Table.O
+						// set the alias name as tblName in the expression
+						cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(on.TblName.L)
+						break
+					}
+				}
+
+				// Fix table names/alias for y X b CTEs END
+
+				// set right and left orig table name in case they are not set yet (may be the case when the side is nonunique, but is not composed of an a X b)
+				if leftOrigTblName == "" {
+					leftOrigTblName = cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Table.O
+				}
+				if rightOrigTblName == "" {
+					rightOrigTblName = cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Table.O
+				}
+				// set right and left orig table name in case they are not set yet END
+
+				// Fix prefix at the expression colname
+				if nonUniqueBothSides { // HERE: <NR>.<ORIGTBLNAME>.<COLNAME>
+					if nonUniqueLeft {
+						sp := strings.Split(cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name.O, ".")
+						cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(sp[0] + "." + leftOrigTblName + "." + sp[1])
+					}
+
+					if nonUniqueRight {
+						sp := strings.Split(cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name.O, ".")
+						cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(sp[0] + "." + rightOrigTblName + "." + sp[1])
+					}
+				} else { // HERE: <ORIGTBLNAME>.<COLNAME>
+					if nonUniqueLeft {
+						cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(leftOrigTblName + "." + cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name.O)
+					}
+
+					if nonUniqueRight {
+						cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(rightOrigTblName + "." + cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name.O)
+					}
+				}
+				// Fix prefix at the expression colname END
+
+				// convert to expression.Expression
+				expr, _ /*np*/, err := b.rewrite(ctx, cloned, pseudoJoinPlanForExpressionRewriter, nil, false)
+				if err != nil {
+					return nil, 0, err
+				}
+				if expr != nil {
+
+					// check if the slice needs to be extended and do so if needed
+					if exprInd == len(convertedExpressions) {
+						extended := make([]expression.Expression, len(convertedExpressions)*2, len(convertedExpressions)*2)
+						copy(extended, convertedExpressions)
+						convertedExpressions = extended
+					}
+
+					// Add to the list of expressions for the semijoin
+					convertedExpressions[exprInd] = expr
+					exprInd++
+				}
+
+			}
+		}
+	}
+
+	// In case we are working on the third phase with width > 1, we have to check for columns with the same origtblname and origcolname. If they are contianed in any vertex of hgmMap, or a PK, then build an expression
+	if cyclic != nil && cyclic[0] {
+		allCols := make([]string, 0)
+		for _, l := range hgmMap {
+			allCols = append(allCols, l...)
+		}
+
+		for _, name1 := range outerPlan.OutputNames().Shallow() {
+			if name1.OrigColName.L == "_tidb_rowid" {
+				continue
+			}
+			for _, name2 := range innerPlan.OutputNames().Shallow() {
+				if name1.OrigTblName.L == name2.OrigTblName.L && name1.OrigColName.L == name2.OrigColName.L {
+					isPk, err := b.isPrimaryKey(name1.DBName, name1.OrigTblName, name1.OrigColName)
+					if err != nil {
+						return nil, 0, err
+					}
+					if slices.Contains(allCols, name1.OrigTblName.L+"."+name1.OrigColName.L) || isPk {
+
+						origExpr := b.templateEQExpression // get template
+						cloned := clone.Clone(origExpr)    // clone template
+
+						// Add prefix in case there is a nonunique column name across the sides
+						prefix1, prefix2 := "", ""
+						if nonUniqueBothSides {
+							prefix1 = "1."
+							prefix2 = "2."
+						}
+
+						// change the clone --> Build ast.BinaryOperationExpr (but keep the type as ast.ExprNode)
+						cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(name1.TblName.O)
+						cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(prefix1 + name1.ColName.O)
+
+						cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Table = model.NewCIStr(name2.TblName.O)
+						cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(prefix2 + name2.ColName.O)
+
+						// Fix prefix at the expression colname
+						if nonUniqueBothSides { // HERE: <NR>.<ORIGTBLNAME>.<COLNAME>
+							if nonUniqueLeft {
+								sp := strings.Split(cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name.O, ".")
+								cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(sp[0] + "." + name1.OrigTblName.O + "." + sp[1])
+							}
+
+							if nonUniqueRight {
+								sp := strings.Split(cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name.O, ".")
+								cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(sp[0] + "." + name2.OrigTblName.O + "." + sp[1])
+							}
+						} else { // HERE: <ORIGTBLNAME>.<COLNAME>
+							if nonUniqueLeft {
+								cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(name1.OrigTblName.O + "." + cloned.(*ast.BinaryOperationExpr).L.(*ast.ColumnNameExpr).Name.Name.O)
+							}
+
+							if nonUniqueRight {
+								cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name = model.NewCIStr(name2.OrigTblName.O + "." + cloned.(*ast.BinaryOperationExpr).R.(*ast.ColumnNameExpr).Name.Name.O)
+							}
+						}
+						// Fix prefix at the expression colname END
+
+						// convert to expression.Expression
+						expr, _ /*np*/, err := b.rewrite(ctx, cloned, pseudoJoinPlanForExpressionRewriter, nil, false)
+						if err != nil {
+							return nil, 0, err
+						}
+						if expr != nil {
+
+							// check if the slice needs to be extended and do so if needed
+							if exprInd == len(convertedExpressions) {
+								extended := make([]expression.Expression, len(convertedExpressions)*2, len(convertedExpressions)*2)
+								copy(extended, convertedExpressions)
+								convertedExpressions = extended
+							}
+
+							// Add to the list of expressions
+							convertedExpressions[exprInd] = expr
+							exprInd++
+						}
+
+					}
+				}
+
+			}
+		}
+
+	}
+
+	return convertedExpressions, exprInd, nil
+
+}
+
+// isPrimaryKey: check if the given colToCheck is a PK of the relation given as schema.tableName
+func (b *PlanBuilder) isPrimaryKey(schema model.CIStr, tableName model.CIStr, colToCheck model.CIStr) (bool, error) {
+	is, _ := sessiontxn.GetTxnManager(b.ctx).GetTxnInfoSchema().(infoschema.InfoSchema)
+	tbl, err := is.TableByName(schema, tableName)
+	if err != nil {
+		return false, err
+	}
+	tableInfo := tbl.Meta()
+	primaryInd := tables.FindPrimaryIndex(tableInfo)
+
+	col := primaryInd.FindColumnByName(colToCheck.L)
+	return col != nil, nil
+}
+
+// Nonunique tbl.col across both sides and per side?
+func checkNonUniqueTblCol(namesLeft types.NameSlice, namesRight types.NameSlice) (nonUniqueBothSides bool, nonUniqueLeft bool, nonUniqueRight bool) {
+	leftAndOverallSeen := make(map[string]bool)
+	rightSeen := make(map[string]bool)
+	var identifier string
+
+	for _, name := range namesLeft {
+		identifier = name.TblName.L + "." + name.ColName.L
+		if leftAndOverallSeen[identifier] {
+			nonUniqueLeft = true
+		}
+		leftAndOverallSeen[identifier] = true
+	}
+
+	for _, name := range namesRight {
+		identifier = name.TblName.L + "." + name.ColName.L
+		if leftAndOverallSeen[identifier] {
+			nonUniqueBothSides = true
+		}
+		if rightSeen[identifier] {
+			nonUniqueRight = true
+		}
+		rightSeen[identifier] = true
+	}
+	return nonUniqueBothSides, nonUniqueLeft, nonUniqueRight
+
+}
+
+// storePlan: like buildCTEStorePlan, but just stores the plan without using a CTE
+func (b *PlanBuilder) storePlan(seedPlan LogicalPlan, nodeName string, phase int) {
+	b.cteSubplans[phase][nodeName] = seedPlan
+}
+
+// resetYanData: reset all data set in a computation of a Yannakakis LogicalPlan createion
+func (b *PlanBuilder) resetYanData() {
+	b.cteSubplans = make(map[int]map[string]LogicalPlan)
+	for i := 0; i <= 2; i++ {
+		b.cteSubplans[i] = make(map[string]LogicalPlan)
+	}
+	b.subplans = make(map[string]LogicalPlan)
+}
+
+// buildCTEStorePlan: build a LogicalCTE with the given seed plan and store it in b.cteSubplans with the given nodeName and the phase
+func (b *PlanBuilder) buildCTEStorePlan(seedPlan LogicalPlan, nodeName string, phase int) LogicalPlan {
+	cte := &CTEClass{IsDistinct: false, seedPartLogicalPlan: seedPlan,
+		recursivePartLogicalPlan: nil, IDForStorage: b.allocIDForCTEStorage,
+		optFlag: uint64(0), HasLimit: false, LimitBeg: uint64(0),
+		LimitEnd: uint64(0), pushDownPredicates: make([]expression.Expression, 0), ColumnMap: make(map[string]*expression.Column)}
+
+	si := &property.StatsInfo{}
+	asName := model.NewCIStr(nodeName)
+
+	// Increment CTE alloc ID
+	b.allocIDForCTEStorage++
+
+	lp := LogicalCTE{cteAsName: asName, cteName: asName, cte: cte, seedStat: si, isOuterMostCTE: false}.Init(b.ctx, b.getSelectOffset())
+	prevSchema := cte.seedPartLogicalPlan.Schema().Clone()
+	lp.SetSchema(getResultCTESchema(cte.seedPartLogicalPlan.Schema(), b.ctx.GetSessionVars()))
+
+	for i, col := range lp.schema.Columns {
+		lp.cte.ColumnMap[string(col.HashCode(nil))] = prevSchema.Columns[i]
+	}
+
+	var p LogicalPlan
+	p = lp
+	p.SetOutputNames(cte.seedPartLogicalPlan.OutputNames())
+	if len(asName.String()) > 0 {
+		lp.cteAsName = asName
+		var on types.NameSlice
+		for _, name := range p.OutputNames() {
+			cpOn := *name
+			cpOn.TblName = asName
+			on = append(on, &cpOn)
+		}
+		p.SetOutputNames(on)
+	}
+
+	b.cteSubplans[phase][nodeName] = p
+	return p
+}
+
+func intersect(bag []string, bag2 []string) []string {
+	m := make(map[string]int)
+	ret := make([]string, 0, 0)
+	for _, s := range bag {
+		m[s] = 1
+	}
+	for _, s := range bag2 {
+		if m[s] == 1 {
+			ret = append(ret, s)
+		}
+	}
+	return ret
+
+}
+
+// isSubset check if the string s1 is a subset of s2
+func isSubset(s1 []string, s2 []string) bool {
+	m := make(map[string]int)
+	for _, s := range s2 { // increment for all values of s2
+		m[s] += 1
+	}
+	for _, s := range s1 { // for each value of s1
+		if n, ok := m[s]; !ok { // if not found --> not a subset
+			return false
+		} else if n < 1 { // if found more times than added --> not a subset
+			return false
+		} else { // decrement
+			m[s] = n - 1
+		}
+	}
+	return true
+
+}
+
+// Get the name of a decomp tree (balancedGo.NodeJson) Node. If multiple relations are included, they are returned as follows: t1 X t2 X ...
+func getDecompTreeNodeName(root balancedGo.NodeJson) string {
+	var sb strings.Builder
+	for i, t := range root.Cover {
+		sb.WriteString(t)
+		if i+1 < len(root.Cover) {
+			sb.WriteString(" X ")
+		}
+	}
+
+	nodeName := sb.String()
+	return nodeName
 }
 
 func (b *PlanBuilder) buildTableDual() *LogicalTableDual {

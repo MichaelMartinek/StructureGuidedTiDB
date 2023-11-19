@@ -305,6 +305,18 @@ type Executor interface {
 
 // Next is a wrapper function on e.Next(), it handles some common codes.
 func Next(ctx context.Context, e Executor, req *chunk.Chunk) error {
+	_, ok := e.(*ExplainExec) // Yan early stop: do only consider stopping if this is not an ExplainExec, otherwise "explain analyze ..." would give an empty result
+
+	// Yan early stop: do not return any more chunks if the statement is recorded as empty
+	if e.base().ctx.GetSessionVars().StmtCtx.GetIsYannakakis() && !ok {
+		if e.base().ctx.GetSessionVars().StmtCtx.GetIsEmpty() {
+			logutil.BgLogger().Info("YAN early stop return empty chunk in Next")
+			req.Reset()
+			return nil
+		}
+	}
+	// Yan early stop end
+
 	base := e.base()
 	if base.runtimeStats != nil {
 		start := time.Now()
@@ -330,6 +342,17 @@ func Next(ctx context.Context, e Executor, req *chunk.Chunk) error {
 	if atomic.LoadUint32(&sessVars.Killed) == 1 {
 		err = ErrQueryInterrupted
 	}
+
+	// Yan early stop: do not return any more chunks if the statement is recorded as empty
+	if e.base().ctx.GetSessionVars().StmtCtx.GetIsYannakakis() && !ok {
+		if e.base().ctx.GetSessionVars().StmtCtx.GetIsEmpty() {
+			logutil.BgLogger().Info("YAN early stop return empty chunk in Next")
+			req.Reset()
+			return nil
+		}
+	}
+	// Yan early stop end
+
 	return err
 }
 

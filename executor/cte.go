@@ -16,6 +16,7 @@ package executor
 
 import (
 	"context"
+	"github.com/pingcap/tidb/util/logutil"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
@@ -184,6 +185,15 @@ func (e *CTEExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 			return err
 		}
 		e.resTbl.SetDone()
+
+		// YAN early stop: check if there are rows in the result, if not, then do a early stop
+		if e.ctx.GetSessionVars().StmtCtx.GetIsYannakakis() {
+			if e.resTbl.NumRows() == 0 {
+				e.ctx.GetSessionVars().StmtCtx.SetIsEmpty()
+				logutil.BgLogger().Info("YAN early stop CTEExec")
+			}
+		}
+		// YAN early stop end
 	}
 
 	if e.hasLimit {

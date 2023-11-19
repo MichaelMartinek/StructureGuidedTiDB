@@ -462,6 +462,44 @@ func optimize(ctx context.Context, sctx sessionctx.Context, node ast.Node, is in
 	finalPlan, cost, err := core.DoOptimize(ctx, sctx, builder.GetOptFlag(), logic)
 	// TODO: capture plan replayer here if it matches sql and plan digest
 
+	// calculate secondary plans
+	if sctx.GetSessionVars().StmtCtx.GetIsYannakakis() {
+		st := time.Now()
+		origSQL := sctx.GetSessionVars().StmtCtx.OriginalSQL
+		minInd := -1
+
+		if len(origSQL) > 100 {
+			logutil.BgLogger().Info(fmt.Sprintf("%s %.2f %s %s", "YAN secondary plans, initial cost: ", cost, ", origSQL: ", origSQL[0:100]))
+		} else {
+			logutil.BgLogger().Info(fmt.Sprintf("%s %.2f %s %s", "YAN secondary plans, initial cost: ", cost, ", origSQL: ", origSQL))
+		}
+
+		for i := 0; i < 2; i++ {
+			secPlanIntf := sctx.GetSessionVars().StmtCtx.GetSecondaryPlan(i)
+			if secPlanIntf == nil { // there are some cases where a secondary plan cannot be created, but a primary can; e.g. when logical_plan_builder.go::containsDuplicateNodeNamesOrEmptyBagCover() returns false a certain amount of times for the decompositions, in this case we will skip this loop iteration
+				continue
+			}
+			secPlan := secPlanIntf.(core.LogicalPlan)
+			secFinalPlan, secCost, err := core.DoOptimize(ctx, sctx, builder.GetOptFlag(), secPlan)
+
+			if err == nil && secCost < cost {
+				minInd = i
+				finalPlan = secFinalPlan
+				cost = secCost
+			}
+		}
+		if minInd != -1 {
+			sctx.GetSessionVars().StmtCtx.SetPrimaryCTEUsageCounter(sctx.GetSessionVars().StmtCtx.GetCTEUsageCounter(minInd + 1))
+		}
+
+		if len(origSQL) > 100 {
+			logutil.BgLogger().Info(fmt.Sprintf("%s %.2f %s %s %s %s", "YAN secondary plans, final cost: ", cost, ", took: ", time.Since(st), ", origSQL: ", origSQL[0:100]))
+		} else {
+			logutil.BgLogger().Info(fmt.Sprintf("%s %.2f %s %s %s %s", "YAN secondary plans, final cost: ", cost, ", took: ", time.Since(st), ", origSQL: ", origSQL))
+		}
+
+	}
+
 	sctx.GetSessionVars().DurationOptimization = time.Since(beginOpt)
 	return finalPlan, names, cost, err
 }
