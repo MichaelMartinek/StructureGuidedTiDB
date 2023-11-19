@@ -8,8 +8,8 @@ require (
 	github.com/pingcap/errors v0.11.5-0.20210425183316-da1aaba5fb63
 	github.com/pingcap/log v0.0.0-20210625125904-98ed8e2eb1c7
 	github.com/stretchr/testify v1.8.2
-	go.uber.org/goleak v1.1.11
-	go.uber.org/zap v1.24.0
+	go.uber.org/goleak v1.2.0
+	go.uber.org/zap v1.26.0
 	golang.org/x/exp v0.0.0-20220428152302-39d4317da171
 	golang.org/x/text v0.7.0
 	modernc.org/parser v1.0.2
@@ -17,12 +17,11 @@ require (
 )
 
 require (
-	github.com/benbjohnson/clock v1.1.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
-	go.uber.org/multierr v1.6.0 // indirect
+	go.uber.org/multierr v1.10.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/golex v1.0.1 // indirect
