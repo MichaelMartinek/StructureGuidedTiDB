@@ -27,4 +27,4 @@ See the [Get Started](https://pingcap.github.io/tidb-dev-guide/get-started/intro
 ## Evaluations
 
 
-Information regarding conducted evaluations are contained the following repository: [StructureGuidedTiDBEvaluation](https://github.com/MichaelMartinek/StructureGuidedTiDBEvaluation) 
+Information regarding conducted evaluations are contained in the following repository: [StructureGuidedTiDBEvaluation](https://github.com/MichaelMartinek/StructureGuidedTiDBEvaluation) 
